@@ -1,0 +1,26 @@
+name = "group_welcome"
+version = "1.0.0"
+description = "入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员"
+author = "NeoBot 第三方插件"
+license = "MIT"
+tags = ["welcome", "group", "notice"]
+priority = 0
+dependencies = []
+python_dependencies = []
+hot_reload = true
+config_hot_reload = true
+
+# 下面只是「打包默认值」：安装/更新插件会覆盖这一段。
+# 真正的运行配置在 data/plugins_data/group_welcome/config.toml（面板「插件 → 配置」可改），
+# 升级插件不会丢。
+[config]
+# 总开关：关闭后所有群都不发欢迎
+enabled = true
+# 欢迎语模板；{at} 会被替换成真正的 @新成员
+template = "欢迎 {at} 加入本群，记得先看群公告～"
+# 合并窗口（秒）：大于 0 时把这段时间内进群的人合并成一条消息，0 表示逐条立即发送
+delay_seconds = 0.0
+# 是否发送退群提示
+leave_enabled = false
+# 退群提示模板
+leave_template = "{name} 离开了本群。"
