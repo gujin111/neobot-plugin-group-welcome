@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0 — 2026-11-12
+
+- 官方通道的入群事件改为**由插件合成**：首句检测到新面孔后构造
+  `post_type=notice / notice_type=group_increase / sub_type=first_speak`，
+  再交给与真实 `group_increase` 完全相同的处理函数，模板、合并窗口、按群定制全部复用
+  - 删除 `first_speak_template`（不再有独立的欢迎语，统一用 `template`）
+- 删除 `/指令图`：宿主 `/help` 本身就是图片卡片（分页、权限维度、预渲染缓存），
+  插件命令会自动出现在里面，不需要第二个命令
+  - 一并移除 `command_image_enabled` / `command_image_theme` / `command_image_width`
+
 ## 1.3.0 — 2026-11-12
 
 新增 `/指令图`：把指令总览以图片发到 QQ。

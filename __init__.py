@@ -42,7 +42,6 @@ class GroupRule(BaseModel):
     enabled: bool = Field(default=True, description="这一群是否发送入群欢迎")
     template: str = Field(default="", description="这一群的欢迎语；留空沿用全局模板")
     leave_template: str = Field(default="", description="这一群的退群提示；留空沿用全局")
-    first_speak_template: str = Field(default="", description="这一群的「首次发言」欢迎语；留空沿用全局")
 
 
 class Config(BaseModel):
@@ -61,26 +60,18 @@ class Config(BaseModel):
     leave_template: str = Field(default="{name} 离开了本群。", description="退群提示模板")
     first_speak_enabled: bool = Field(
         default=False,
-        description="官方通道没有入群事件，只能在他第一次发言时欢迎；开启后按「没见过的发言人」触发",
-    )
-    first_speak_template: str = Field(
-        default="", description="「首次发言」欢迎语；留空沿用上面的欢迎语模板"
+        description="官方通道没有入群事件：开启后把「没见过的发言人」的首句发言合成为入群事件，走同一套欢迎模板",
     )
     first_speak_warmup_minutes: int = Field(
         default=60,
         description="启蒙期（分钟）：插件第一次见到某个群后的这段时间里只记录、不欢迎，避免给全群老人发欢迎",
     )
-    command_image_enabled: bool = Field(
-        default=True, description="启用 /指令图：把当前可用的全部指令渲染成一张图片"
-    )
-    command_image_theme: str = Field(default="default", description="指令图片主题（宿主内置主题名）")
-    command_image_width: int = Field(default=760, description="指令图片宽度（像素）")
     groups: list[GroupRule] = Field(default_factory=list, description="按群定制（每个群一条）")
 
 
 plugin = Plugin(
     "group_welcome",
-    version="1.3.0",
+    version="1.4.0",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -346,7 +337,7 @@ async def _send_now(ctx, group_id: int, template: str, members: list[tuple[int, 
     await _send(ctx, group_id, chain, "入群欢迎")
 
 
-# ── 首句欢迎（官方通道没有入群事件时的替代方案）──────────────────
+# ── 官方通道入群事件（首句检测合成）────────────────────────────
 
 
 def _load_seen(path: Path | None) -> None:
@@ -409,13 +400,34 @@ def _bump_notice(event: dict[str, Any]) -> None:
 
 @plugin.event(post_type="message")
 async def on_group_message(event: dict[str, Any], ctx, config: Config) -> None:
-    """首句欢迎：官方通道拿不到入群事件，只能靠「没见过的发言人」近似。"""
+    """官方通道的入群事件来源：把「没见过的发言人」的首句补成 group_increase。"""
     if not config.first_speak_enabled:
         return
     try:
         await _handle_first_speak(event, ctx, config)
     except Exception as exc:
-        ctx.logger.warning(f"[group_welcome] 首句欢迎处理失败: {type(exc).__name__}: {exc}")
+        ctx.logger.warning(f"[group_welcome] 官方通道入群事件处理失败: {type(exc).__name__}: {exc}")
+
+
+def _synthetic_join_event(event: dict[str, Any]) -> dict[str, Any]:
+    """把「官方通道里某个 openid 第一次发言」合成为一条入群事件。
+
+    官方适配器只映射 C2C / GROUP / GROUP_AT 三种消息事件（official/events.py 的
+    ``MESSAGE_EVENTS``），平台也不给群成员列表，所以拿不到真正的 ``group_increase``。
+    这里补出同形状的 notice，后续完全复用入群欢迎那条链路（模板 / 合并窗口 / 按群规则），
+    区别只在 ``sub_type`` 标成 ``first_speak``，方便日志与排错。
+    """
+    return {
+        "time": event.get("time") or int(time.time()),
+        "self_id": event.get("self_id"),
+        "post_type": "notice",
+        "notice_type": "group_increase",
+        "sub_type": "first_speak",
+        "group_id": event.get("group_id"),
+        "user_id": event.get("user_id"),
+        "operator_id": None,
+        "synthetic": True,
+    }
 
 
 async def _handle_first_speak(event: dict[str, Any], ctx, config: Config) -> None:
@@ -426,16 +438,6 @@ async def _handle_first_speak(event: dict[str, Any], ctx, config: Config) -> Non
     if group_id is None or user_id is None:
         return
     if user_id == _to_int(event.get("self_id")):
-        return
-    rule = _rule_for(config, group_id)
-    if rule is not None and not rule.enabled:
-        return
-    template = (
-        rule.first_speak_template.strip()
-        if rule is not None and rule.first_speak_template.strip()
-        else config.first_speak_template.strip() or _effective_welcome(config, rule)
-    )
-    if not template:
         return
 
     group_key = _display_group_id(group_id)
@@ -457,8 +459,8 @@ async def _handle_first_speak(event: dict[str, Any], ctx, config: Config) -> Non
     if not _remember_user(group_key, user_key):
         return
     _save_seen()
-    name = await _display_name(ctx, event, user_id, group_id)
-    await _send_now(ctx, group_id, template, [(user_id, name)])
+    ctx.logger.info(f"[group_welcome] 官方通道：{user_key} 的首句发言合成为入群事件（群 {group_key}）")
+    await _handle_increase(_synthetic_join_event(event), ctx, config, source="first_speak")
 
 
 # ── 事件 ──────────────────────────────────────────────────────────
@@ -474,7 +476,7 @@ async def on_group_increase(event: dict[str, Any], ctx, config: Config) -> None:
         ctx.logger.warning(f"[group_welcome] 入群欢迎处理失败: {type(exc).__name__}: {exc}")
 
 
-async def _handle_increase(event: dict[str, Any], ctx, config: Config) -> None:
+async def _handle_increase(event: dict[str, Any], ctx, config: Config, source: str = "notice") -> None:
     if not config.enabled:
         return
     group_id = _to_int(event.get("group_id"))
@@ -493,13 +495,15 @@ async def _handle_increase(event: dict[str, Any], ctx, config: Config) -> None:
 
     name = await _display_name(ctx, event, user_id, group_id)
     if config.first_speak_enabled:
-        # 入群时欢迎过的人，首句欢迎就别再喊一次
+        # 入群时欢迎过的人，官方通道的首句检测就别再喊一次
         _remember_user(_display_group_id(group_id), _display_user_id(user_id))
         _save_seen()
     delay = max(0.0, min(float(config.delay_seconds or 0.0), _MAX_DELAY))
     if delay > 0:
         _queue(ctx, group_id, template, user_id, name, delay)
         return
+    if source == "first_speak":
+        ctx.logger.info(f"[group_welcome] 按合成入群事件欢迎 {user_id}（群 {group_id}）")
     await _send_now(ctx, group_id, template, [(user_id, name)])
 
 
@@ -574,7 +578,7 @@ def _status_text(config: Config, group_id: int) -> str:
     if state.get("started") and warmup:
         left = max(0, int(warmup - (time.time() - float(state["started"]))))
     lines.append(
-        f"首句欢迎：{'开' if config.first_speak_enabled else '关'}（已记录 {seen_count} 人"
+        f"官方通道入群事件：{'开' if config.first_speak_enabled else '关'}（首句检测，已记录 {seen_count} 人"
         + (f"，启蒙期剩 {left // 60} 分钟" if left else "")
         + "）"
     )
@@ -619,156 +623,9 @@ async def welcome_command(
     if text in {"重置", "reset"}:
         _seen.pop(_display_group_id(group_id), None)
         _save_seen()
-        return "已清空本群的首句欢迎记录，接下来会重新进入启蒙期。"
+        return "已清空本群的首句检测记录，接下来会重新进入启蒙期。"
 
     return _HELP
-
-
-# ── 指令图片 ──────────────────────────────────────────────────────
-
-_PERMISSION_LABELS = {0: "所有人", 1: "次级管理员", 2: "超级管理员"}
-
-
-def _command_service(ctx) -> Any:
-    services = getattr(getattr(ctx, "plugin_host", None), "services", None)
-    if services is None:
-        return None
-    try:
-        return services.get("command_service")
-    except Exception:
-        return None
-
-
-def _collect_commands(ctx, user_id: int | None, keyword: str = "") -> list[dict[str, Any]]:
-    """列出调用者有权使用的全部命令（本体命令 + 各插件命令）。"""
-    service = _command_service(ctx)
-    if service is None:
-        return []
-    try:
-        commands = list(service.registry.commands())
-    except Exception:
-        return []
-    permissions = getattr(service, "permissions", None)
-    lowered = (keyword or "").strip().lower()
-    rows: list[dict[str, Any]] = []
-    for command in commands:
-        level = int(getattr(command, "permission", 0) or 0)
-        if permissions is not None and user_id is not None:
-            try:
-                if not permissions.can(user_id, level):
-                    continue
-            except Exception:
-                pass
-        name = str(getattr(command, "name", "") or "")
-        usage = str(getattr(command, "usage", "") or "")
-        description = str(getattr(command, "description", "") or "")
-        source = str(getattr(command, "source", "") or "")
-        if lowered and lowered not in f"{name} {usage} {description} {source}".lower():
-            continue
-        rows.append(
-            {
-                "name": name,
-                "usage": usage,
-                "description": description,
-                "permission": level,
-                "source": source,
-            }
-        )
-    rows.sort(key=lambda item: (item["permission"], item["name"].lower()))
-    return rows
-
-
-def _command_label(row: dict[str, Any]) -> str:
-    return f"/{row['name']}" + (f" {row['usage']}" if row["usage"] else "")
-
-
-def _commands_text(rows: list[dict[str, Any]], title: str) -> str:
-    lines = [f"{title}（图片渲染不可用，先给文字版）", ""]
-    for row in rows:
-        label = _PERMISSION_LABELS.get(row["permission"], str(row["permission"]))
-        if row["source"]:
-            label += f" / {row['source']}"
-        lines.append(f"{_command_label(row)} — {row['description'] or '—'}  [{label}]")
-    lines.append("")
-    lines.append(f"共 {len(rows)} 条。发 /指令图 关键词 可以过滤。")
-    return "\n".join(lines)
-
-
-async def _render_commands_image(ctx, rows: list[dict[str, Any]], config: Config) -> bytes | None:
-    """用宿主的卡片渲染器出 PNG；任何一步不可用都返回 None 交给文字兜底。"""
-    if not rows:
-        return None
-    try:
-        from neobot_app.runtime.html_card import render_card_html, render_card_image
-    except Exception as exc:
-        ctx.logger.warning(f"[group_welcome] 无法导入卡片渲染模块: {type(exc).__name__}: {exc}")
-        return None
-
-    table: list[list[str]] = []
-    for row in rows:
-        meta = [_PERMISSION_LABELS.get(row["permission"], str(row["permission"]))]
-        if row["source"]:
-            meta.append(row["source"])
-        table.append([_command_label(row), row["description"] or "—", " / ".join(meta)])
-
-    try:
-        html = render_card_html(
-            title="指令总览",
-            subtitle=f"共 {len(rows)} 条 · 只列出你有权限使用的",
-            blocks=[
-                {
-                    "kind": "rows",
-                    "columns": ["指令", "说明", "权限 / 来源"],
-                    "widths": ["40%", "38%", "22%"],
-                    "rows": table,
-                }
-            ],
-            footer="发「/指令图 关键词」可以过滤",
-            theme=str(config.command_image_theme or "default"),
-            width=int(config.command_image_width or 760),
-        )
-    except Exception as exc:
-        ctx.logger.warning(f"[group_welcome] 卡片 HTML 生成失败: {type(exc).__name__}: {exc}")
-        return None
-
-    try:
-        return await render_card_image(
-            html,
-            timeout=25.0,
-            screenshots=getattr(ctx, "screenshots", None),
-        )
-    except Exception as exc:
-        ctx.logger.warning(f"[group_welcome] 卡片渲染失败: {type(exc).__name__}: {exc}")
-        return None
-
-
-@plugin.command(
-    "指令图 [keyword:rest]",
-    permission=0,
-    description="把当前可用的全部指令渲染成一张图片",
-    aliases=("helpimg", "命令图", "指令总览"),
-)
-async def command_image(
-    keyword: str | None,
-    event: dict[str, Any],
-    ctx,
-    config: Config,
-    reply,
-) -> str | None:
-    if not config.command_image_enabled:
-        return "指令图片功能已关闭（command_image_enabled = false）。"
-    rows = _collect_commands(ctx, _to_int(event.get("user_id")), keyword or "")
-    if not rows:
-        return "没有可显示的指令：命令服务不可用，或关键词没匹配到。"
-    title = "指令总览" if not (keyword or "").strip() else f"指令总览（{keyword.strip()}）"
-    png = await _render_commands_image(ctx, rows, config)
-    if png:
-        try:
-            await reply.image(data=png, filename="commands.png")
-            return None
-        except Exception as exc:
-            ctx.logger.warning(f"[group_welcome] 指令图发送失败，回退文字: {type(exc).__name__}: {exc}")
-    return _commands_text(rows, title)
 
 
 # ── 生命周期 ──────────────────────────────────────────────────────
