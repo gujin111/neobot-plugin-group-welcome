@@ -223,11 +223,66 @@ class FakeAdapter:
         return {"group_name": self.group_name}
 
 
+class FakeCommand:
+    def __init__(self, name, usage="", description="", permission=0, source=""):
+        self.name = name
+        self.usage = usage
+        self.description = description
+        self.permission = permission
+        self.source = source
+
+
+class FakeRegistry:
+    def __init__(self, commands):
+        self._commands = list(commands)
+
+    def commands(self):
+        return list(self._commands)
+
+
+class FakePermissions:
+    def __init__(self, max_level=0):
+        self.max_level = max_level
+
+    def can(self, user_id, level):
+        return int(level) <= self.max_level
+
+
+class FakeCommandService:
+    def __init__(self, commands, max_level=0):
+        self.registry = FakeRegistry(commands)
+        self.permissions = FakePermissions(max_level)
+
+
+class FakeServices:
+    def __init__(self, mapping):
+        self._map = dict(mapping)
+
+    def get(self, name):
+        return self._map.get(name)
+
+
+class FakeHost:
+    def __init__(self, services):
+        self.services = services
+
+
+class FakeReply:
+    """只记录发出去的图片，够断言用。"""
+
+    def __init__(self):
+        self.images = []
+
+    async def image(self, *, data=None, filename=None):
+        self.images.append((data, filename))
+
+
 class FakeCtx:
-    def __init__(self, *, profiles=None, group_name="测试群", data_dir=None) -> None:
+    def __init__(self, *, profiles=None, group_name="测试群", data_dir=None, services=None) -> None:
         self.logger = FakeLogger()
         self.users = FakeUsers(profiles or {})
         self.adapter = FakeAdapter(group_name)
+        self.plugin_host = FakeHost(FakeServices(services or {}))
         self.data_dir = Path(data_dir) if data_dir else RUNTIME_DIR / f"case-{next(_CASE_IDS)}"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.sent: list[tuple[int, FakeChain]] = []
@@ -540,6 +595,75 @@ async def case_first_speak() -> None:
     check("默认关闭时不触发", len(ctx4.sent) == 0, str(len(ctx4.sent)))
 
 
+def _install_html_card_stub(png: bytes = b"\x89PNG-fake") -> dict:
+    """假的宿主卡片渲染器：确认插件真的走了「出图」这条路。"""
+    package = sys.modules.get("neobot_app") or types.ModuleType("neobot_app")
+    runtime = types.ModuleType("neobot_app.runtime")
+    card = types.ModuleType("neobot_app.runtime.html_card")
+    calls: dict = {}
+
+    def render_card_html(**kwargs):
+        calls["html"] = kwargs
+        return "<html>card</html>"
+
+    async def render_card_image(html, *, timeout=20.0, screenshots=None, fonts=None):
+        calls["html_input"] = html
+        return png
+
+    card.render_card_html = render_card_html
+    card.render_card_image = render_card_image
+    runtime.html_card = card
+    package.runtime = runtime
+    sys.modules["neobot_app"] = package
+    sys.modules["neobot_app.runtime"] = runtime
+    sys.modules["neobot_app.runtime.html_card"] = card
+    return calls
+
+
+def _uninstall_html_card_stub() -> None:
+    for name in ("neobot_app.runtime.html_card", "neobot_app.runtime", "neobot_app"):
+        sys.modules.pop(name, None)
+
+
+async def case_command_image() -> None:
+    print("指令图片：/指令图")
+    commands = [
+        FakeCommand("欢迎", usage="[action:rest]", description="入群欢迎：预览 / 查看本群配置", source="group_welcome"),
+        FakeCommand("指令图", usage="[keyword:rest]", description="把可用指令渲染成图片", source="group_welcome"),
+        FakeCommand("deploy", description="部署（管理员）", permission=2, source="dashboard"),
+        FakeCommand("help", description="查看帮助"),
+    ]
+    ctx = FakeCtx(services={"command_service": FakeCommandService(commands, max_level=0)})
+    config = make_config()
+
+    reply = FakeReply()
+    text = await _PLUGIN.command_image("", {"user_id": 123}, ctx, config, reply)
+    check("没有渲染器时回退文字", isinstance(text, str) and "/欢迎" in text, str(text)[:80])
+    check("过滤掉无权使用的命令", "deploy" not in (text or ""), str(text)[:120])
+    check("回退时不发图", not reply.images, str(reply.images))
+
+    calls = _install_html_card_stub()
+    try:
+        reply2 = FakeReply()
+        result = await _PLUGIN.command_image("", {"user_id": 123, "group_id": 999}, ctx, config, reply2)
+        check("出图成功时不再回文字", result is None, str(result))
+        check("发了一张图", len(reply2.images) == 1 and reply2.images[0][0] == b"\x89PNG-fake", str(reply2.images))
+        block = (calls.get("html") or {}).get("blocks", [{}])[0]
+        check("用 rows 表格承载指令", block.get("kind") == "rows", str(block.get("kind")))
+        check("表格里有指令行", len(block.get("rows") or []) == 3, str(len(block.get("rows") or [])))
+        check("宽度可配", (calls.get("html") or {}).get("width") == 760, str((calls.get("html") or {}).get("width")))
+
+        reply3 = FakeReply()
+        filtered = await _PLUGIN.command_image("欢迎", {"user_id": 123, "group_id": 999}, ctx, config, reply3)
+        check("关键词过滤命中", filtered is None and len(reply3.images) == 1, str(filtered))
+        check("过滤后只剩 1 行", len(calls["html"]["blocks"][0]["rows"]) == 1, str(calls["html"]["blocks"][0]["rows"]))
+    finally:
+        _uninstall_html_card_stub()
+
+    off = await _PLUGIN.command_image("", {"user_id": 123}, ctx, make_config(command_image_enabled=False), FakeReply())
+    check("开关关闭时直接提示", "已关闭" in (off or ""), str(off))
+
+
 async def main() -> int:
     global _PLUGIN
     _PLUGIN = load_plugin()
@@ -559,9 +683,13 @@ async def main() -> int:
     )
     message_subs = [item for item in _PLUGIN.plugin.events if item["options"].get("post_type") == "message"]
     check("订阅群消息（首句欢迎用）", len(message_subs) == 1, str(len(message_subs)))
-    check("注册了命令", len(_PLUGIN.plugin.commands) == 1)
-    command = _PLUGIN.plugin.commands[0]
-    check("命令要权限 0", command["options"].get("permission") == 0, str(command["options"]))
+    check("注册了 2 个命令", len(_PLUGIN.plugin.commands) == 2, str(len(_PLUGIN.plugin.commands)))
+    for command in _PLUGIN.plugin.commands:
+        check(
+            f"命令 {command['pattern'].split()[0]} 要权限 0",
+            command["options"].get("permission") == 0,
+            str(command["options"]),
+        )
 
     case_toml()
     await case_single_welcome()
@@ -574,6 +702,7 @@ async def main() -> int:
     await case_command()
     await case_official_ids()
     await case_first_speak()
+    await case_command_image()
 
     print()
     if _FAILED:

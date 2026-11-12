@@ -1,5 +1,5 @@
 name = "group_welcome"
-version = "1.2.0"
+version = "1.3.0"
 description = "入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员"
 author = "NeoBot 第三方插件"
 license = "MIT"
@@ -30,3 +30,9 @@ first_speak_enabled = false
 first_speak_template = ""
 # 启蒙期（分钟）：刚接入的这段时间只记录、不欢迎，避免给全群老人刷屏
 first_speak_warmup_minutes = 60
+# 指令图片：把当前可用的全部指令渲染成一张图
+command_image_enabled = true
+# 指令图片主题（宿主内置主题名，未知主题会回落 default）
+command_image_theme = "default"
+# 指令图片宽度（像素）
+command_image_width = 760

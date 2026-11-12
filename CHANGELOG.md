@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0 — 2026-11-12
+
+新增 `/指令图`：把指令总览以图片发到 QQ。
+
+- 从宿主 `command_service` 取命令表，按调用者权限过滤，再交给
+  `neobot_app.runtime.html_card` 渲染成 PNG
+- 三级回退：卡片渲染不可用 → 文字版；图片发送失败 → 文字版；关键词无命中 → 提示
+- 关键词按命令名/用法/说明/来源做子串过滤，例如 `/指令图 欢迎`
+- 新增配置 `command_image_enabled` / `command_image_theme` / `command_image_width`
+- 别名 `/helpimg`、`/命令图`、`/指令总览`
+
 ## 1.2.0 — 2026-11-12
 
 官方通道没有入群事件，补一条能落地的替代路径。

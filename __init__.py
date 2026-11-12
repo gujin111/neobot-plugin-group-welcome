@@ -70,12 +70,17 @@ class Config(BaseModel):
         default=60,
         description="启蒙期（分钟）：插件第一次见到某个群后的这段时间里只记录、不欢迎，避免给全群老人发欢迎",
     )
+    command_image_enabled: bool = Field(
+        default=True, description="启用 /指令图：把当前可用的全部指令渲染成一张图片"
+    )
+    command_image_theme: str = Field(default="default", description="指令图片主题（宿主内置主题名）")
+    command_image_width: int = Field(default=760, description="指令图片宽度（像素）")
     groups: list[GroupRule] = Field(default_factory=list, description="按群定制（每个群一条）")
 
 
 plugin = Plugin(
     "group_welcome",
-    version="1.2.0",
+    version="1.3.0",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -617,6 +622,153 @@ async def welcome_command(
         return "已清空本群的首句欢迎记录，接下来会重新进入启蒙期。"
 
     return _HELP
+
+
+# ── 指令图片 ──────────────────────────────────────────────────────
+
+_PERMISSION_LABELS = {0: "所有人", 1: "次级管理员", 2: "超级管理员"}
+
+
+def _command_service(ctx) -> Any:
+    services = getattr(getattr(ctx, "plugin_host", None), "services", None)
+    if services is None:
+        return None
+    try:
+        return services.get("command_service")
+    except Exception:
+        return None
+
+
+def _collect_commands(ctx, user_id: int | None, keyword: str = "") -> list[dict[str, Any]]:
+    """列出调用者有权使用的全部命令（本体命令 + 各插件命令）。"""
+    service = _command_service(ctx)
+    if service is None:
+        return []
+    try:
+        commands = list(service.registry.commands())
+    except Exception:
+        return []
+    permissions = getattr(service, "permissions", None)
+    lowered = (keyword or "").strip().lower()
+    rows: list[dict[str, Any]] = []
+    for command in commands:
+        level = int(getattr(command, "permission", 0) or 0)
+        if permissions is not None and user_id is not None:
+            try:
+                if not permissions.can(user_id, level):
+                    continue
+            except Exception:
+                pass
+        name = str(getattr(command, "name", "") or "")
+        usage = str(getattr(command, "usage", "") or "")
+        description = str(getattr(command, "description", "") or "")
+        source = str(getattr(command, "source", "") or "")
+        if lowered and lowered not in f"{name} {usage} {description} {source}".lower():
+            continue
+        rows.append(
+            {
+                "name": name,
+                "usage": usage,
+                "description": description,
+                "permission": level,
+                "source": source,
+            }
+        )
+    rows.sort(key=lambda item: (item["permission"], item["name"].lower()))
+    return rows
+
+
+def _command_label(row: dict[str, Any]) -> str:
+    return f"/{row['name']}" + (f" {row['usage']}" if row["usage"] else "")
+
+
+def _commands_text(rows: list[dict[str, Any]], title: str) -> str:
+    lines = [f"{title}（图片渲染不可用，先给文字版）", ""]
+    for row in rows:
+        label = _PERMISSION_LABELS.get(row["permission"], str(row["permission"]))
+        if row["source"]:
+            label += f" / {row['source']}"
+        lines.append(f"{_command_label(row)} — {row['description'] or '—'}  [{label}]")
+    lines.append("")
+    lines.append(f"共 {len(rows)} 条。发 /指令图 关键词 可以过滤。")
+    return "\n".join(lines)
+
+
+async def _render_commands_image(ctx, rows: list[dict[str, Any]], config: Config) -> bytes | None:
+    """用宿主的卡片渲染器出 PNG；任何一步不可用都返回 None 交给文字兜底。"""
+    if not rows:
+        return None
+    try:
+        from neobot_app.runtime.html_card import render_card_html, render_card_image
+    except Exception as exc:
+        ctx.logger.warning(f"[group_welcome] 无法导入卡片渲染模块: {type(exc).__name__}: {exc}")
+        return None
+
+    table: list[list[str]] = []
+    for row in rows:
+        meta = [_PERMISSION_LABELS.get(row["permission"], str(row["permission"]))]
+        if row["source"]:
+            meta.append(row["source"])
+        table.append([_command_label(row), row["description"] or "—", " / ".join(meta)])
+
+    try:
+        html = render_card_html(
+            title="指令总览",
+            subtitle=f"共 {len(rows)} 条 · 只列出你有权限使用的",
+            blocks=[
+                {
+                    "kind": "rows",
+                    "columns": ["指令", "说明", "权限 / 来源"],
+                    "widths": ["40%", "38%", "22%"],
+                    "rows": table,
+                }
+            ],
+            footer="发「/指令图 关键词」可以过滤",
+            theme=str(config.command_image_theme or "default"),
+            width=int(config.command_image_width or 760),
+        )
+    except Exception as exc:
+        ctx.logger.warning(f"[group_welcome] 卡片 HTML 生成失败: {type(exc).__name__}: {exc}")
+        return None
+
+    try:
+        return await render_card_image(
+            html,
+            timeout=25.0,
+            screenshots=getattr(ctx, "screenshots", None),
+        )
+    except Exception as exc:
+        ctx.logger.warning(f"[group_welcome] 卡片渲染失败: {type(exc).__name__}: {exc}")
+        return None
+
+
+@plugin.command(
+    "指令图 [keyword:rest]",
+    permission=0,
+    description="把当前可用的全部指令渲染成一张图片",
+    aliases=("helpimg", "命令图", "指令总览"),
+)
+async def command_image(
+    keyword: str | None,
+    event: dict[str, Any],
+    ctx,
+    config: Config,
+    reply,
+) -> str | None:
+    if not config.command_image_enabled:
+        return "指令图片功能已关闭（command_image_enabled = false）。"
+    rows = _collect_commands(ctx, _to_int(event.get("user_id")), keyword or "")
+    if not rows:
+        return "没有可显示的指令：命令服务不可用，或关键词没匹配到。"
+    title = "指令总览" if not (keyword or "").strip() else f"指令总览（{keyword.strip()}）"
+    png = await _render_commands_image(ctx, rows, config)
+    if png:
+        try:
+            await reply.image(data=png, filename="commands.png")
+            return None
+        except Exception as exc:
+            ctx.logger.warning(f"[group_welcome] 指令图发送失败，回退文字: {type(exc).__name__}: {exc}")
+    return _commands_text(rows, title)
 
 
 # ── 生命周期 ──────────────────────────────────────────────────────
