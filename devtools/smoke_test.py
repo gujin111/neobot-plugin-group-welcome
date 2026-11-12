@@ -112,6 +112,7 @@ class FakePlugin:
         self.events: list[dict] = []
         self.commands: list[dict] = []
         self.load_hooks: list = []
+        self.startup_hooks: list = []
         self.shutdown_hooks: list = []
 
     def event(self, **kwargs):
@@ -130,6 +131,10 @@ class FakePlugin:
 
     def on_load(self, handler):
         self.load_hooks.append(handler)
+        return handler
+
+    def on_startup(self, handler):
+        self.startup_hooks.append(handler)
         return handler
 
     def on_shutdown(self, handler):
@@ -216,11 +221,20 @@ class FakeAdapter:
 
     def __init__(self, group_name: str = "测试群") -> None:
         self.group_name = group_name
+        #: {群号: [{"user_id": n}, ...]}，模拟 get_group_member_list 的返回
+        self.members: dict[int, list[dict]] = {}
+        self.groups: list[dict] = []
 
     async def get_group_info(self, group_id):
         if self.group_name is None:
             raise RuntimeError("适配器不支持")
         return {"group_name": self.group_name}
+
+    async def get_group_member_list(self, group_id):
+        return {"status": "ok", "retcode": 0, "data": list(self.members.get(int(group_id), []))}
+
+    async def get_group_list(self):
+        return {"status": "ok", "retcode": 0, "data": list(self.groups)}
 
 
 class FakeServices:
@@ -501,64 +515,54 @@ async def case_official_ids() -> None:
     check("无映射模块照常工作", bool(ctx3.sent) and "999" in ctx3.sent[0][1].plain(), "no send")
 
 
-def group_message(user_id=1, group_id=999, self_id=10000):
-    return {
-        "post_type": "message",
-        "message_type": "group",
-        "group_id": group_id,
-        "user_id": user_id,
-        "self_id": self_id,
-    }
-
-
-async def case_first_speak() -> None:
-    print("官方通道：首句检测合成为入群事件")
-    ctx = FakeCtx(profiles={"1": FakeProfile("1", nickname="甲"), "2": FakeProfile("2", nickname="乙")})
+async def case_join_poll() -> None:
+    print("自己检测入群：轮询成员列表做差集")
+    ctx = FakeCtx(profiles={"1": FakeProfile("1", nickname="甲"), "3": FakeProfile("3", nickname="丙")})
     await _PLUGIN.on_load(ctx)
-    config = make_config(
-        first_speak_enabled=True,
-        first_speak_warmup_minutes=0,
-        template="欢迎 {at} {name} 进群",
-    )
+    ctx.adapter.members[999] = [{"user_id": 1}, {"user_id": 2}]
+    config = make_config(join_poll_enabled=True, join_poll_groups=[999])
+    await _PLUGIN._poll_once(ctx, config)
+    check("首轮只登记名册、不补欢迎", len(ctx.sent) == 0, str(len(ctx.sent)))
+    check("名册已落盘", (ctx.data_dir / "seen.json").is_file())
 
-    synthetic = _PLUGIN._synthetic_join_event(
-        {"group_id": 999, "user_id": 2, "self_id": 10000, "message_type": "group"}
-    )
-    check("合成事件的种类是 notice", synthetic["post_type"] == "notice", str(synthetic))
-    check("合成事件复用了 group_increase", synthetic["notice_type"] == "group_increase", str(synthetic))
-    check("合成事件标了 sub_type", synthetic["sub_type"] == "first_speak", str(synthetic))
+    ctx.adapter.members[999].append({"user_id": 3})
+    await _PLUGIN._poll_once(ctx, config)
+    check("多出来的人触发欢迎", len(ctx.sent) == 1, str(len(ctx.sent)))
+    check("欢迎语 @ 到新人", ctx.sent[0][1].ats() == ["3"], str(ctx.sent[0][1].ats()))
 
-    await _PLUGIN.on_group_message(group_message(1), ctx, config)
-    check("第一次见群只建档不欢迎", len(ctx.sent) == 0, str(len(ctx.sent)))
-    check("seen.json 已落盘", (ctx.data_dir / "seen.json").is_file())
+    await _PLUGIN._poll_once(ctx, config)
+    check("同一批人不会重复欢迎", len(ctx.sent) == 1, str(len(ctx.sent)))
 
-    await _PLUGIN.on_group_message(group_message(1), ctx, config)
-    check("老人不再欢迎", len(ctx.sent) == 0, str(len(ctx.sent)))
+    # 真实入群事件欢迎过的人，轮询不应再喊一次
+    ctx2 = FakeCtx(profiles={"5": FakeProfile("5")})
+    await _PLUGIN.on_load(ctx2)
+    cfg2 = make_config(join_poll_enabled=True, join_poll_groups=[888])
+    ctx2.adapter.members[888] = [{"user_id": 5}]
+    await _PLUGIN.on_group_increase(join_event(user_id=5, group_id=888), ctx2, cfg2)
+    before = len(ctx2.sent)
+    await _PLUGIN._poll_once(ctx2, cfg2)
+    check("notice 欢迎过的人不重复", len(ctx2.sent) == before, f"{before} -> {len(ctx2.sent)}")
 
-    await _PLUGIN.on_group_message(group_message(2), ctx, config)
-    check("新面孔首句触发欢迎", len(ctx.sent) == 1, str(len(ctx.sent)))
-    check("用的是入群欢迎模板", "进群" in ctx.sent[0][1].plain(), ctx.sent[0][1].plain())
-    check("首句也 @ 人", ctx.sent[0][1].ats() == ["2"], str(ctx.sent[0][1].ats()))
+    # 官方通道：成员列表接口返回空
+    ctx3 = FakeCtx()
+    await _PLUGIN.on_load(ctx3)
+    await _PLUGIN._poll_once(ctx3, make_config(join_poll_enabled=True, join_poll_groups=[777]))
+    check("拿不到名单时安静跳过", len(ctx3.sent) == 0, str(len(ctx3.sent)))
+    check("跳过时不写名册", not (ctx3.data_dir / "seen.json").is_file())
 
-    await _PLUGIN.on_group_message(group_message(2), ctx, config)
-    check("同一个人只欢迎一次", len(ctx.sent) == 1, str(len(ctx.sent)))
+    # 关闭开关不轮询
+    ctx4 = FakeCtx()
+    ctx4.adapter.members[999] = [{"user_id": 9}]
+    await _PLUGIN._poll_once(ctx4, make_config(join_poll_enabled=False, join_poll_groups=[999]))
+    check("开关关闭时不动", len(ctx4.sent) == 0, str(len(ctx4.sent)))
 
-    ctx2 = FakeCtx(profiles={"3": FakeProfile("3"), "4": FakeProfile("4")})
-    cfg2 = make_config(first_speak_enabled=True, first_speak_warmup_minutes=60)
-    await _PLUGIN.on_group_message(group_message(3, group_id=777), ctx2, cfg2)
-    await _PLUGIN.on_group_message(group_message(4, group_id=777), ctx2, cfg2)
-    check("启蒙期内不欢迎", len(ctx2.sent) == 0, str(len(ctx2.sent)))
-
-    ctx3 = FakeCtx(profiles={"5": FakeProfile("5")})
-    cfg3 = make_config(first_speak_enabled=True, first_speak_warmup_minutes=0)
-    await _PLUGIN.on_group_increase(join_event(user_id=5, group_id=888), ctx3, cfg3)
-    before = len(ctx3.sent)
-    await _PLUGIN.on_group_message(group_message(5, group_id=888), ctx3, cfg3)
-    check("入群已欢迎的人不重复欢迎", len(ctx3.sent) == before, f"{before} -> {len(ctx3.sent)}")
-
-    ctx4 = FakeCtx(profiles={"6": FakeProfile("6")})
-    await _PLUGIN.on_group_message(group_message(6), ctx4, make_config(first_speak_enabled=False))
-    check("默认关闭时不触发", len(ctx4.sent) == 0, str(len(ctx4.sent)))
+    # 没配 join_poll_groups 时退回 groups 里的群
+    ctx5 = FakeCtx(profiles={"7": FakeProfile("7")})
+    await _PLUGIN.on_load(ctx5)
+    ctx5.adapter.members[555] = [{"user_id": 6}]
+    cfg5 = make_config(join_poll_enabled=True, groups=[_PLUGIN.GroupRule(group_id=555)])
+    await _PLUGIN._poll_once(ctx5, cfg5)
+    check("按 groups 里的群轮询", len(ctx5.sent) == 0 and (_PLUGIN._seen.get("555") is not None), str(_PLUGIN._seen.keys()))
 
 
 async def main() -> int:
@@ -569,7 +573,7 @@ async def main() -> int:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
     check("插件名", _PLUGIN.plugin.name == "group_welcome", _PLUGIN.plugin.name)
-    check("注册了 3 个事件订阅", len(_PLUGIN.plugin.events) == 3, str(len(_PLUGIN.plugin.events)))
+    check("注册了 2 个事件订阅", len(_PLUGIN.plugin.events) == 2, str(len(_PLUGIN.plugin.events)))
     notice_types = sorted(
         item["options"]["notice_type"] for item in _PLUGIN.plugin.events if item["options"].get("notice_type")
     )
@@ -578,9 +582,6 @@ async def main() -> int:
         notice_types == ["group_decrease", "group_increase"],
         str(notice_types),
     )
-    message_subs = [item for item in _PLUGIN.plugin.events if item["options"].get("post_type") == "message"]
-    check("订阅群消息（官方通道入群事件用）", len(message_subs) == 1, str(len(message_subs)))
-    check("注册了 1 个命令（指令总览交给宿主 /help）", len(_PLUGIN.plugin.commands) == 1, str(len(_PLUGIN.plugin.commands)))
     for command in _PLUGIN.plugin.commands:
         check(
             f"命令 {command['pattern'].split()[0]} 要权限 0",
@@ -598,7 +599,7 @@ async def main() -> int:
     await case_leave()
     await case_command()
     await case_official_ids()
-    await case_first_speak()
+    await case_join_poll()
 
     print()
     if _FAILED:

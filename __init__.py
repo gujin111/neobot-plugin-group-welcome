@@ -58,20 +58,21 @@ class Config(BaseModel):
     )
     leave_enabled: bool = Field(default=False, description="是否发送退群提示")
     leave_template: str = Field(default="{name} 离开了本群。", description="退群提示模板")
-    first_speak_enabled: bool = Field(
+    join_poll_enabled: bool = Field(
         default=False,
-        description="官方通道没有入群事件：开启后把「没见过的发言人」的首句发言合成为入群事件，走同一套欢迎模板",
+        description="自己检测入群：定时拉群成员列表做差集，不依赖通道推送 notice",
     )
-    first_speak_warmup_minutes: int = Field(
-        default=60,
-        description="启蒙期（分钟）：插件第一次见到某个群后的这段时间里只记录、不欢迎，避免给全群老人发欢迎",
+    join_poll_seconds: int = Field(default=300, description="轮询间隔（秒），小于 60 按 60 算")
+    join_poll_groups: list[int] = Field(
+        default_factory=list,
+        description="要轮询的群；留空则轮询 groups 里配置的群，再不行问适配器要群列表",
     )
     groups: list[GroupRule] = Field(default_factory=list, description="按群定制（每个群一条）")
 
 
 plugin = Plugin(
     "group_welcome",
-    version="1.4.0",
+    version="1.5.0",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -83,7 +84,7 @@ _pending: dict[int, list[tuple[int, str]]] = {}
 _flush_tasks: dict[int, asyncio.Task] = {}
 _group_names: dict[int, str] = {}
 
-#: 首句欢迎的「已见成员」：{展示群号: {"users": {用户: 1}, "started": 时间戳}}
+#: 已知成员名册：{展示群号: {"users": {用户: 1}, "started": 首次登记时间}}
 _seen: dict[str, dict[str, Any]] = {}
 _seen_path: Path | None = None
 _seen_loaded = False
@@ -197,15 +198,18 @@ def _pick(data: Any, *keys: str) -> str:
     return ""
 
 
-async def _display_name(ctx, event: dict[str, Any], user_id: int, group_id: int) -> str:
-    """优先用群名片，其次昵称，最后退回 QQ 号。"""
-    try:
-        profile = ctx.users.from_event(event)
-        name = (getattr(profile, "card", None) or getattr(profile, "nickname", None) or "").strip()
-        if name:
-            return name
-    except Exception:
-        pass
+async def _display_name(
+    ctx, event: dict[str, Any] | None, user_id: int, group_id: int
+) -> str:
+    """优先用群名片，其次昵称，最后退回 QQ 号。轮询路径没有事件，event 传 None。"""
+    if event:
+        try:
+            profile = ctx.users.from_event(event)
+            name = (getattr(profile, "card", None) or getattr(profile, "nickname", None) or "").strip()
+            if name:
+                return name
+        except Exception:
+            pass
     try:
         profile = await ctx.users.get(str(user_id), group_id=str(group_id))
         name = (profile.card or profile.nickname or "").strip()
@@ -337,7 +341,7 @@ async def _send_now(ctx, group_id: int, template: str, members: list[tuple[int, 
     await _send(ctx, group_id, chain, "入群欢迎")
 
 
-# ── 官方通道入群事件（首句检测合成）────────────────────────────
+# ── 入群检测：轮询成员列表（不依赖 notice 推送）────────────────
 
 
 def _load_seen(path: Path | None) -> None:
@@ -398,69 +402,106 @@ def _bump_notice(event: dict[str, Any]) -> None:
         _notice_count[key] = _notice_count.get(key, 0) + 1
 
 
-@plugin.event(post_type="message")
-async def on_group_message(event: dict[str, Any], ctx, config: Config) -> None:
-    """官方通道的入群事件来源：把「没见过的发言人」的首句补成 group_increase。"""
-    if not config.first_speak_enabled:
-        return
+# ── 自己检测入群：定时拉成员列表做差集 ────────────────────────────
+
+
+async def _fetch_member_ids(ctx, group_id: int) -> list[int] | None:
+    """拉一次群成员列表；不支持 / 失败 / 为空都返回 None（当作「这次看不到」）。"""
+    getter = getattr(getattr(ctx, "adapter", None), "get_group_member_list", None)
+    if not callable(getter):
+        return None
     try:
-        await _handle_first_speak(event, ctx, config)
+        payload = await getter(group_id)
     except Exception as exc:
-        ctx.logger.warning(f"[group_welcome] 官方通道入群事件处理失败: {type(exc).__name__}: {exc}")
+        ctx.logger.warning(f"[group_welcome] 拉群 {group_id} 成员失败: {type(exc).__name__}: {exc}")
+        return None
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(items, (list, tuple)) or not items:
+        return None
+    ids: list[int] = []
+    for item in items:
+        raw = item.get("user_id") if isinstance(item, dict) else item
+        uid = _to_int(raw)
+        if uid is not None:
+            ids.append(uid)
+    return ids or None
 
 
-def _synthetic_join_event(event: dict[str, Any]) -> dict[str, Any]:
-    """把「官方通道里某个 openid 第一次发言」合成为一条入群事件。
+async def _poll_targets(ctx, config: Config) -> list[int]:
+    """要轮询的群：显式配置优先，其次 groups，最后问适配器要群列表。"""
+    targets: set[int] = set()
+    for raw in config.join_poll_groups or ():
+        number = _to_int(raw)
+        if number is not None:
+            targets.add(number)
+    if not targets:
+        for rule in config.groups or ():
+            number = _to_int(rule.group_id)
+            if number is not None:
+                targets.add(number)
+    if targets:
+        return sorted(targets)
 
-    官方适配器只映射 C2C / GROUP / GROUP_AT 三种消息事件（official/events.py 的
-    ``MESSAGE_EVENTS``），平台也不给群成员列表，所以拿不到真正的 ``group_increase``。
-    这里补出同形状的 notice，后续完全复用入群欢迎那条链路（模板 / 合并窗口 / 按群规则），
-    区别只在 ``sub_type`` 标成 ``first_speak``，方便日志与排错。
-    """
-    return {
-        "time": event.get("time") or int(time.time()),
-        "self_id": event.get("self_id"),
-        "post_type": "notice",
-        "notice_type": "group_increase",
-        "sub_type": "first_speak",
-        "group_id": event.get("group_id"),
-        "user_id": event.get("user_id"),
-        "operator_id": None,
-        "synthetic": True,
-    }
+    getter = getattr(getattr(ctx, "adapter", None), "get_group_list", None)
+    if not callable(getter):
+        return []
+    try:
+        payload = await getter()
+    except Exception:
+        return []
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    for item in items or ():
+        raw = item.get("group_id") if isinstance(item, dict) else item
+        number = _to_int(raw)
+        if number is not None:
+            targets.add(number)
+    return sorted(targets)
 
 
-async def _handle_first_speak(event: dict[str, Any], ctx, config: Config) -> None:
-    if str(event.get("message_type") or "") != "group":
+async def _poll_once(ctx, config: Config) -> None:
+    """检查一轮：首次见到某群只记名册，之后多出来的人按入群处理。"""
+    if not config.join_poll_enabled:
         return
-    group_id = _to_int(event.get("group_id"))
-    user_id = _to_int(event.get("user_id"))
-    if group_id is None or user_id is None:
+    targets = await _poll_targets(ctx, config)
+    if not targets:
+        ctx.logger.info("[group_welcome] 入群轮询：没有可检查的群，请配置 join_poll_groups")
         return
-    if user_id == _to_int(event.get("self_id")):
-        return
-
-    group_key = _display_group_id(group_id)
-    user_key = _display_user_id(user_id)
-    state = _seen.get(group_key)
-    if state is None:
-        # 第一次见到这个群：只建档并记录当前发言人。否则会把全群老人挨个欢迎一遍。
-        _remember_user(group_key, user_key)
-        _save_seen()
-        ctx.logger.info(f"[group_welcome] 开始跟踪群 {group_key}，启蒙期内只记录不欢迎")
-        return
-
-    warmup = max(0, int(config.first_speak_warmup_minutes or 0)) * 60
-    if warmup and time.time() - float(state.get("started") or 0.0) < warmup:
-        if _remember_user(group_key, user_key):
+    for group_id in targets:
+        members = await _fetch_member_ids(ctx, group_id)
+        if not members:
+            continue
+        group_key = _display_group_id(group_id)
+        state = _seen.get(group_key)
+        if state is None:
+            # 第一次拿到这个群的名单：只登记，不补欢迎（否则会把全群老人刷一遍）
+            for uid in members:
+                _remember_user(group_key, _display_user_id(uid))
             _save_seen()
-        return
+            ctx.logger.info(f"[group_welcome] 入群轮询：首次记录群 {group_key} 的 {len(members)} 名成员")
+            continue
 
-    if not _remember_user(group_key, user_key):
-        return
-    _save_seen()
-    ctx.logger.info(f"[group_welcome] 官方通道：{user_key} 的首句发言合成为入群事件（群 {group_key}）")
-    await _handle_increase(_synthetic_join_event(event), ctx, config, source="first_speak")
+        known = state["users"]
+        fresh = [uid for uid in members if _display_user_id(uid) not in known]
+        if not fresh:
+            continue
+        for uid in fresh:
+            _remember_user(group_key, _display_user_id(uid))
+        _save_seen()
+        ctx.logger.info(f"[group_welcome] 入群轮询：群 {group_key} 新增 {len(fresh)} 人")
+        for uid in fresh:
+            await _welcome_member(ctx, config, group_id, uid, source="poll")
+
+
+async def _poll_loop(ctx, config: Config) -> None:
+    interval = max(60, int(config.join_poll_seconds or 300))
+    while True:
+        try:
+            await _poll_once(ctx, config)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            ctx.logger.warning(f"[group_welcome] 入群轮询失败: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(interval)
 
 
 # ── 事件 ──────────────────────────────────────────────────────────
@@ -485,7 +526,21 @@ async def _handle_increase(event: dict[str, Any], ctx, config: Config, source: s
         return
     if user_id == _to_int(event.get("self_id")):
         return  # 机器人自己被拉进群，不用欢迎自己
+    await _welcome_member(ctx, config, group_id, user_id, source=source, event=event)
 
+
+async def _welcome_member(
+    ctx,
+    config: Config,
+    group_id: int,
+    user_id: int,
+    *,
+    source: str = "notice",
+    event: dict[str, Any] | None = None,
+) -> None:
+    """欢迎一个新成员；notice 推送和轮询检测共用这一条出口。"""
+    if not config.enabled:
+        return
     rule = _rule_for(config, group_id)
     if rule is not None and not rule.enabled:
         return
@@ -493,17 +548,17 @@ async def _handle_increase(event: dict[str, Any], ctx, config: Config, source: s
     if not template:
         return
 
+    # 记进名册：轮询看到这人已在册就不会再欢迎一次
+    _remember_user(_display_group_id(group_id), _display_user_id(user_id))
+    _save_seen()
+
     name = await _display_name(ctx, event, user_id, group_id)
-    if config.first_speak_enabled:
-        # 入群时欢迎过的人，官方通道的首句检测就别再喊一次
-        _remember_user(_display_group_id(group_id), _display_user_id(user_id))
-        _save_seen()
     delay = max(0.0, min(float(config.delay_seconds or 0.0), _MAX_DELAY))
     if delay > 0:
         _queue(ctx, group_id, template, user_id, name, delay)
         return
-    if source == "first_speak":
-        ctx.logger.info(f"[group_welcome] 按合成入群事件欢迎 {user_id}（群 {group_id}）")
+    if source != "notice":
+        ctx.logger.info(f"[group_welcome] 按{source}检测到的入群欢迎 {user_id}（群 {group_id}）")
     await _send_now(ctx, group_id, template, [(user_id, name)])
 
 
@@ -573,14 +628,9 @@ def _status_text(config: Config, group_id: int) -> str:
     group_key = _display_group_id(group_id)
     state = _seen.get(group_key) or {}
     seen_count = len(state.get("users") or {})
-    warmup = max(0, int(config.first_speak_warmup_minutes or 0)) * 60
-    left = 0
-    if state.get("started") and warmup:
-        left = max(0, int(warmup - (time.time() - float(state["started"]))))
     lines.append(
-        f"官方通道入群事件：{'开' if config.first_speak_enabled else '关'}（首句检测，已记录 {seen_count} 人"
-        + (f"，启蒙期剩 {left // 60} 分钟" if left else "")
-        + "）"
+        f"入群轮询：{'开' if config.join_poll_enabled else '关'}"
+        f"（间隔 {max(60, int(config.join_poll_seconds or 300))} 秒，本群已记录 {seen_count} 人）"
     )
     lines.append(f"本群 notice 事件：{_notice_count.get(str(group_id), 0)} 条（官方通道恒为 0）")
     return "\n".join(lines)
@@ -623,7 +673,7 @@ async def welcome_command(
     if text in {"重置", "reset"}:
         _seen.pop(_display_group_id(group_id), None)
         _save_seen()
-        return "已清空本群的首句检测记录，接下来会重新进入启蒙期。"
+        return "已清空本群的成员名册，下一轮轮询会重新登记（不补欢迎）。"
 
     return _HELP
 
@@ -636,6 +686,16 @@ async def on_load(ctx) -> None:
     data_dir = getattr(ctx, "data_dir", None)
     _load_seen(Path(data_dir) / "seen.json" if data_dir is not None else None)
     ctx.logger.info("[group_welcome] 已加载：入群欢迎 + 退群提示")
+
+
+@plugin.on_startup
+async def on_startup(ctx, config: Config) -> None:
+    if not config.join_poll_enabled:
+        return
+    ctx.create_task(_poll_loop(ctx, config), name="group_welcome-poll")
+    ctx.logger.info(
+        f"[group_welcome] 入群轮询已启动，间隔 {max(60, int(config.join_poll_seconds or 300))} 秒"
+    )
 
 
 @plugin.on_shutdown

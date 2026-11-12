@@ -1,5 +1,5 @@
 name = "group_welcome"
-version = "1.4.0"
+version = "1.5.0"
 description = "入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员"
 author = "NeoBot 第三方插件"
 license = "MIT"
@@ -24,7 +24,9 @@ delay_seconds = 0.0
 leave_enabled = false
 # 退群提示模板
 leave_template = "{name} 离开了本群。"
-# 官方通道没有入群事件：把「没见过的发言人」的首句合成为入群事件，走同一套模板
-first_speak_enabled = false
-# 启蒙期（分钟）：刚接入的这段时间只记录、不欢迎，避免给全群老人刷屏
-first_speak_warmup_minutes = 60
+# 自己检测入群：定时拉群成员列表做差集，不依赖通道推送 notice
+join_poll_enabled = false
+# 轮询间隔（秒），小于 60 按 60 算
+join_poll_seconds = 300
+# 要轮询的群；留空则用 groups 里配置的群，再不行问适配器要群列表
+join_poll_groups = []
