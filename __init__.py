@@ -60,7 +60,7 @@ class Config(BaseModel):
 
 plugin = Plugin(
     "group_welcome",
-    version="1.0.0",
+    version="1.1.0",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -85,13 +85,64 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+def _identity_module() -> Any:
+    """宿主的「官方合成 ID ↔ 真实 QQ/群号」人工映射。
+
+    官方通道只给 openid，NeoBot 内部换成 13 位合成号（9.xT），和真实群号没有
+    任何 API 可以互转，只能靠管理员 `/linkgroup`（本群 + 群号）写进
+    ``data/user_qq_map.json``。拿不到这个模块就退化成原样使用事件里的 ID，
+    OneBot 环境本来就不需要它。
+    """
+    try:
+        from neobot_app import user_identity  # 运行期可选依赖
+
+        return user_identity
+    except Exception:
+        return None
+
+
+def _real_group_number(group_id: Any) -> int | None:
+    """合成群号 → 真实群号；没绑定或本来就是真群号时返回 None。"""
+    module = _identity_module()
+    if module is None:
+        return None
+    try:
+        return _to_int(module.group_number_for(group_id))
+    except Exception:
+        return None
+
+
+def _real_user_id(user_id: Any) -> int | None:
+    """合成用户号 → 真实 QQ 号；没绑定或本来就是真 QQ 号时返回 None。"""
+    module = _identity_module()
+    if module is None:
+        return None
+    try:
+        return _to_int(module.qq_for_user(user_id))
+    except Exception:
+        return None
+
+
+def _display_group_id(group_id: Any) -> str:
+    """对外展示用群号：能映射就显示真实群号，否则显示通道 ID。"""
+    return str(_real_group_number(group_id) or group_id)
+
+
+def _display_user_id(user_id: Any) -> str:
+    """对外展示用 QQ 号：能映射就显示真实 QQ，否则显示通道 ID。"""
+    return str(_real_user_id(user_id) or user_id)
+
+
 def _rule_for(config: Config, group_id: int) -> GroupRule | None:
+    """按群命中规则；``groups[].group_id`` 写真实群号或合成 ID 都能匹配。"""
+    candidates = {group_id, _real_group_number(group_id)}
     for rule in config.groups or ():
         try:
-            if int(rule.group_id) == group_id:
-                return rule
+            number = int(rule.group_id)
         except (TypeError, ValueError):
             continue
+        if number in candidates:
+            return rule
     return None
 
 
@@ -155,7 +206,7 @@ async def _group_name(ctx, group_id: int) -> str:
             name = _pick(await getter(group_id), "group_name", "name")
         except Exception:
             name = ""
-    name = name or str(group_id)
+    name = name or _display_group_id(group_id)
     _group_names[group_id] = name
     return name
 
@@ -184,17 +235,23 @@ async def _build_chain(
     names = [name for _, name in members]
     now = datetime.now()
     needs_group = "{group}" in template or "{group_name}" in template
-    group_name = await _group_name(ctx, group_id) if needs_group else str(group_id)
+    group_name = await _group_name(ctx, group_id) if needs_group else _display_group_id(group_id)
+    display_ids = [_display_user_id(uid) for uid in user_ids]
     values = {
         "at": _AT_MARK,
         "name": "、".join(names),
         "user": "、".join(names),
         "nickname": "、".join(names),
-        "id": "、".join(str(uid) for uid in user_ids),
-        "user_id": "、".join(str(uid) for uid in user_ids),
+        # 展示用：官方通道下映射得到真实 QQ，没绑定则是合成号
+        "id": "、".join(display_ids),
+        "user_id": "、".join(display_ids),
+        "qq_id": "、".join(display_ids),
+        # 通道原始 ID（官方通道是 13 位合成号 / openid，OneBot 就是真号）
+        "raw_id": "、".join(str(uid) for uid in user_ids),
         "group": group_name,
         "group_name": group_name,
-        "group_id": str(group_id),
+        "group_id": _display_group_id(group_id),
+        "raw_group_id": str(group_id),
         "time": now.strftime("%Y-%m-%d %H:%M:%S"),
         "date": now.strftime("%Y-%m-%d"),
         "clock": now.strftime("%H:%M:%S"),
@@ -332,9 +389,10 @@ async def _handle_decrease(event: dict[str, Any], ctx, config: Config) -> None:
 _HELP = (
     "入群欢迎用法：\n"
     "/欢迎 预览 —— 在本群按当前配置发一条示例\n"
-    "/欢迎 状态 —— 查看本群的生效配置\n"
+    "/欢迎 状态 —— 查看本群的生效配置与身份绑定\n"
     "模板变量：{at} @新成员、{name} 昵称、{id} QQ号、{group} 群名、"
-    "{group_id} 群号、{time} 时间、{date} 日期、{br} 换行"
+    "{group_id} 群号、{time} 时间、{date} 日期、{br} 换行；"
+    "官方通道下 {id}/{group_id} 显示映射后的真实号码，{raw_id}/{raw_group_id} 显示通道 ID"
 )
 
 
@@ -342,8 +400,13 @@ def _status_text(config: Config, group_id: int) -> str:
     rule = _rule_for(config, group_id)
     template = _effective_welcome(config, rule)
     leave = _effective_leave(config, rule)
-    lines = [
-        f"群 {group_id} 的入群欢迎配置：",
+    real = _real_group_number(group_id)
+    lines = [f"群 {_display_group_id(group_id)} 的入群欢迎配置："]
+    if real:
+        lines.append(f"通道 ID：{group_id}（已绑定真实群号 {real}）")
+    else:
+        lines.append(f"通道 ID：{group_id}（未绑定真实群号，管理员在本群发 /linkgroup <群号> 即可绑定）")
+    lines += [
         f"总开关：{'开' if config.enabled else '关'}",
         f"本群开关：{'开' if (rule is None or rule.enabled) else '关'}"
         f"{'（按群定制）' if rule is not None else '（未定制，用全局）'}",

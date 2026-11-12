@@ -1,4 +1,4 @@
-﻿"""离线冒烟测试：不需要装 NeoBot / pydantic，用最小 stub 跑插件的核心逻辑。
+"""离线冒烟测试：不需要装 NeoBot / pydantic，用最小 stub 跑插件的核心逻辑。
 
 跑法（仓库根目录或本目录都行）：
 
@@ -137,6 +137,31 @@ def _install_modloader_stub() -> None:
     module.MessageChain = FakeChain
     module.Plugin = FakePlugin
     sys.modules["neobot_modloader"] = module
+
+
+def _install_identity_stub(group_map=None, user_map=None) -> None:
+    """装一个假的 neobot_app.user_identity，模拟管理员用 /linkgroup 建过绑定。"""
+    package = types.ModuleType("neobot_app")
+    module = types.ModuleType("neobot_app.user_identity")
+    groups = dict(group_map or {})
+    users = dict(user_map or {})
+
+    def group_number_for(group_id, channel=None):
+        return groups.get(int(group_id))
+
+    def qq_for_user(user_id, channel=None):
+        return users.get(int(user_id))
+
+    module.group_number_for = group_number_for
+    module.qq_for_user = qq_for_user
+    package.user_identity = module
+    sys.modules["neobot_app"] = package
+    sys.modules["neobot_app.user_identity"] = module
+
+
+def _uninstall_identity_stub() -> None:
+    sys.modules.pop("neobot_app.user_identity", None)
+    sys.modules.pop("neobot_app", None)
 
 
 # ── 假运行时对象 ──────────────────────────────────────────────────
@@ -398,6 +423,11 @@ def case_toml() -> None:
     print("plugin.toml 与配置模型一致")
     data = tomllib.loads(PLUGIN_TOML.read_text(encoding="utf-8"))
     check("name 一致", data["name"] == _PLUGIN.plugin.name, str(data.get("name")))
+    check(
+        "version 一致",
+        data["version"] == _PLUGIN.plugin.kwargs.get("version"),
+        f'{data.get("version")} vs {_PLUGIN.plugin.kwargs.get("version")}',
+    )
     config_keys = set(data.get("config", {}))
     model_keys = set(_PLUGIN.Config.__fields__)
     check("配置键都在模型里", config_keys <= model_keys, str(config_keys - model_keys))
@@ -408,6 +438,46 @@ def case_toml() -> None:
         empty_ok = False
         detail = f"{type(exc).__name__}: {exc}"
     check("空配置可构造（字段都有默认值）", empty_ok, "" if empty_ok else detail)
+
+
+async def case_official_ids() -> None:
+    print("官方通道：合成 ID ↔ 真实群号 / QQ 映射")
+    synthetic_group = 9_500_000_000_000
+    synthetic_user = 9_000_000_000_001
+    _install_identity_stub(
+        group_map={synthetic_group: 123456789},
+        user_map={synthetic_user: 88888888},
+    )
+    try:
+        ctx = FakeCtx(profiles={str(synthetic_user): FakeProfile(str(synthetic_user), nickname="小明")})
+        rule = _PLUGIN.GroupRule(group_id=123456789, template="定制 {at} {id} 进 {group_id}")
+        await _PLUGIN.on_group_increase(
+            join_event(user_id=synthetic_user, group_id=synthetic_group),
+            ctx,
+            make_config(groups=[rule]),
+        )
+        check("配置写真实群号也能命中", len(ctx.sent) == 1, str(len(ctx.sent)))
+        chain = ctx.sent[0][1]
+        check("@ 仍用合成 ID（协议要求）", chain.ats() == [str(synthetic_user)], str(chain.ats()))
+        check("{id} 显示真实 QQ", "88888888" in chain.plain(), chain.plain())
+        check("{group_id} 显示真实群号", "123456789" in chain.plain(), chain.plain())
+
+        ctx2 = FakeCtx(profiles={str(synthetic_user): FakeProfile(str(synthetic_user))})
+        cfg2 = make_config(template="原始 {raw_group_id}")
+        await _PLUGIN.on_group_increase(
+            join_event(user_id=synthetic_user, group_id=synthetic_group), ctx2, cfg2
+        )
+        check("{raw_group_id} 保持合成号", str(synthetic_group) in ctx2.sent[0][1].plain(), ctx2.sent[0][1].plain())
+
+        status = await _PLUGIN.welcome_command("状态", {"group_id": synthetic_group, "user_id": 1}, ctx2, cfg2)
+        check("状态显示已绑定", "已绑定真实群号 123456789" in (status or ""), status or "")
+    finally:
+        _uninstall_identity_stub()
+
+    # 没有 user_identity 模块（纯 OneBot / 未绑定）时不能崩
+    ctx3 = FakeCtx()
+    await _PLUGIN.on_group_increase(join_event(group_id=999, user_id=123), ctx3, make_config(template="欢迎 {at} {group_id}"))
+    check("无映射模块照常工作", bool(ctx3.sent) and "999" in ctx3.sent[0][1].plain(), "no send")
 
 
 async def main() -> int:
@@ -435,6 +505,7 @@ async def main() -> int:
     await case_switches()
     await case_leave()
     await case_command()
+    await case_official_ids()
 
     print()
     if _FAILED:

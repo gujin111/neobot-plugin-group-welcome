@@ -1,4 +1,4 @@
-﻿# group_welcome — NeoBot 入群欢迎插件
+# group_welcome — NeoBot 入群欢迎插件
 
 给 [NeoBot](https://github.com/SuperQuail/NeoBot) 用的入群欢迎 / 退群提示插件，走 NeoBot 自己的插件 API（`neobot_modloader`），**不是 Koishi 插件**，装到 Koishi 里没有任何效果。
 
@@ -58,9 +58,11 @@
 | --- | --- | --- |
 | `{at}` | @ 新成员 | 每个人都 @ 一次 |
 | `{name}` / `{user}` / `{nickname}` | 群名片 → 昵称 → QQ 号 | 用 `、` 连起来 |
-| `{id}` / `{user_id}` | QQ 号 | 用 `、` 连起来 |
+| `{id}` / `{user_id}` | QQ 号（官方通道显示绑定后的真实号，未绑定则显示合成 ID） | 用 `、` 连起来 |
+| `{raw_id}` | 通道原始用户 ID（官方通道是 13 位合成号） | 用 `、` 连起来 |
 | `{group}` / `{group_name}` | 群名（查不到就用群号） | 同上 |
-| `{group_id}` | 群号 | — |
+| `{group_id}` | 群号（官方通道显示绑定后的真实群号） | — |
+| `{raw_group_id}` | 通道原始群 ID（官方通道是 13 位合成号） | — |
 | `{time}` | `2026-11-12 14:30:00` | 发送时刻 |
 | `{date}` | `2026-11-12` | 发送时刻 |
 | `{clock}` | `14:30:00` | 发送时刻 |
@@ -110,11 +112,39 @@ enabled = false        # 这个群不欢迎，也不发退群
 
 命令注册在宿主命令表里（权限 0 = 所有人），因此 `/help` 里能看到，并带 `[来源: group_welcome]` 标记。
 
+## 官方机器人通道（13 位合成 ID）
+
+NeoBot 2.1.0a8 起，新部署默认走 QQ 官方机器人通道（`adapter.mode = official`）。官方只给 openid，NeoBot 换成 13 位合成号（群 `9.5T…`、用户 `9.0T…`），和真实群号/QQ 号**没有任何 API 能互转**，只能人工绑定。
+
+本插件对这件事的处理：
+
+1. **配置照旧写真实群号**。`groups[].group_id = 123456789` 在官方通道下也能命中：插件通过宿主的 `neobot_app.user_identity` 把进来的合成群号反查成真实群号再比对，写合成 ID 也能匹配。
+2. **展示自动用真实号**。`{group_id}`、`{id}`、`/欢迎 状态` 都优先显示绑定后的真实号，没绑定才显示合成号；想拿原始 ID 用 `{raw_group_id}` / `{raw_id}`。
+3. **`{at}` 始终用合成 ID 发**——官方协议只认 openid，这是对的，别改成真实号。
+
+绑定方法（宿主内置，一次一个群）：
+
+```text
+/linkgroup 123456789        # 在目标群里由管理员发，把当前群绑定成这个真实群号
+/linkqq @某人 10001         # 同理，绑定成员的 QQ 号
+```
+
+映射存在 `data/user_qq_map.json`，绑定后 `/欢迎 状态` 会显示「已绑定真实群号 xxx」。
+
+> ⚠️ **必须先知道的一件事**：官方通道**不推送群成员变动事件**。
+> `packages/adapter/src/neobot_adapter/official/events.py` 里 `MESSAGE_EVENTS` 只有
+> `C2C_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` 三种消息事件，
+> 其它 dispatch 一律丢弃；同时 `get_group_member_list` 在官方通道直接返回 `[]`（没有成员列表接口）。
+> 所以**纯官方通道下本插件不会被触发**——不是 ID 对不上，是根本没有「有人进群」这个信号。
+> 想要真正的入群欢迎，让 NeoBot 跑 `adapter.mode = dual`（同时挂 OneBot/NapCat），
+> 入群事件由 OneBot 侧带来，群号天然就是真实群号，本插件直接可用。
+
 ## 排错
 
 | 现象 | 排查方向 |
 | --- | --- |
 | 进群完全没反应 | ① 面板里 `group_welcome` 是否已启用；② 协议端是否在推 `group_increase`（NapCat 的日志里能看到 `notice` 事件）；③ `enabled`、该群 `enabled`、`template` 是否被关/清空 |
+| 官方通道下收不到欢迎 | 正常现象：官方通道没有群成员变动事件（见上一节），改 `adapter.mode = dual` 用 OneBot 侧触发 |
 | 有欢迎语但没 @ 到人 | 模板里少了 `{at}`；部分协议端对群成员变动事件不带昵称，`{at}` 仍然可用 |
 | `{name}` 显示成 QQ 号 | 群成员资料接口没返回（比如人刚进群、缓存未命中），属正常回退 |
 | 退群提示不出现 | 默认 `leave_enabled = false`；另外退群事件本身可能不带昵称 |
