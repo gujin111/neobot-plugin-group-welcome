@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import itertools
+import shutil
 import sys
 import tomllib
 import types
@@ -21,6 +23,9 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 PLUGIN_INIT = PLUGIN_DIR / "__init__.py"
 PLUGIN_TOML = PLUGIN_DIR / "plugin.toml"
+#: 测试用的临时数据目录。放在仓库里而不是系统 %TEMP%，后者在受限沙箱下不可写。
+RUNTIME_DIR = PLUGIN_DIR / "devtools" / ".runtime-test"
+_CASE_IDS = itertools.count(1)
 
 
 # ── stub: pydantic ────────────────────────────────────────────────
@@ -219,10 +224,12 @@ class FakeAdapter:
 
 
 class FakeCtx:
-    def __init__(self, *, profiles=None, group_name="测试群") -> None:
+    def __init__(self, *, profiles=None, group_name="测试群", data_dir=None) -> None:
         self.logger = FakeLogger()
         self.users = FakeUsers(profiles or {})
         self.adapter = FakeAdapter(group_name)
+        self.data_dir = Path(data_dir) if data_dir else RUNTIME_DIR / f"case-{next(_CASE_IDS)}"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         self.sent: list[tuple[int, FakeChain]] = []
         self.tasks: list[asyncio.Task] = []
 
@@ -480,18 +487,78 @@ async def case_official_ids() -> None:
     check("无映射模块照常工作", bool(ctx3.sent) and "999" in ctx3.sent[0][1].plain(), "no send")
 
 
+def group_message(user_id=1, group_id=999, self_id=10000):
+    return {
+        "post_type": "message",
+        "message_type": "group",
+        "group_id": group_id,
+        "user_id": user_id,
+        "self_id": self_id,
+    }
+
+
+async def case_first_speak() -> None:
+    print("首句欢迎（官方通道的替代方案）")
+    ctx = FakeCtx(profiles={"1": FakeProfile("1", nickname="甲"), "2": FakeProfile("2", nickname="乙")})
+    await _PLUGIN.on_load(ctx)
+    config = make_config(
+        first_speak_enabled=True,
+        first_speak_warmup_minutes=0,
+        first_speak_template="首句欢迎 {at} {name}",
+    )
+
+    await _PLUGIN.on_group_message(group_message(1), ctx, config)
+    check("第一次见群只建档不欢迎", len(ctx.sent) == 0, str(len(ctx.sent)))
+    check("seen.json 已落盘", (ctx.data_dir / "seen.json").is_file())
+
+    await _PLUGIN.on_group_message(group_message(1), ctx, config)
+    check("老人不再欢迎", len(ctx.sent) == 0, str(len(ctx.sent)))
+
+    await _PLUGIN.on_group_message(group_message(2), ctx, config)
+    check("新面孔首句欢迎", len(ctx.sent) == 1, str(len(ctx.sent)))
+    check("用首句模板", "首句欢迎" in ctx.sent[0][1].plain(), ctx.sent[0][1].plain())
+    check("首句也 @ 人", ctx.sent[0][1].ats() == ["2"], str(ctx.sent[0][1].ats()))
+
+    await _PLUGIN.on_group_message(group_message(2), ctx, config)
+    check("同一个人只欢迎一次", len(ctx.sent) == 1, str(len(ctx.sent)))
+
+    ctx2 = FakeCtx(profiles={"3": FakeProfile("3"), "4": FakeProfile("4")})
+    cfg2 = make_config(first_speak_enabled=True, first_speak_warmup_minutes=60)
+    await _PLUGIN.on_group_message(group_message(3, group_id=777), ctx2, cfg2)
+    await _PLUGIN.on_group_message(group_message(4, group_id=777), ctx2, cfg2)
+    check("启蒙期内不欢迎", len(ctx2.sent) == 0, str(len(ctx2.sent)))
+
+    ctx3 = FakeCtx(profiles={"5": FakeProfile("5")})
+    cfg3 = make_config(first_speak_enabled=True, first_speak_warmup_minutes=0)
+    await _PLUGIN.on_group_increase(join_event(user_id=5, group_id=888), ctx3, cfg3)
+    before = len(ctx3.sent)
+    await _PLUGIN.on_group_message(group_message(5, group_id=888), ctx3, cfg3)
+    check("入群已欢迎的人不重复欢迎", len(ctx3.sent) == before, f"{before} -> {len(ctx3.sent)}")
+
+    ctx4 = FakeCtx(profiles={"6": FakeProfile("6")})
+    await _PLUGIN.on_group_message(group_message(6), ctx4, make_config(first_speak_enabled=False))
+    check("默认关闭时不触发", len(ctx4.sent) == 0, str(len(ctx4.sent)))
+
+
 async def main() -> int:
     global _PLUGIN
     _PLUGIN = load_plugin()
+    # 每次跑都从空数据目录开始，否则上一次的 seen.json 会让「新面孔」判定错位
+    shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
     check("插件名", _PLUGIN.plugin.name == "group_welcome", _PLUGIN.plugin.name)
-    check("注册了 2 个事件", len(_PLUGIN.plugin.events) == 2, str(len(_PLUGIN.plugin.events)))
-    notice_types = sorted(item["options"].get("notice_type", "") for item in _PLUGIN.plugin.events)
+    check("注册了 3 个事件订阅", len(_PLUGIN.plugin.events) == 3, str(len(_PLUGIN.plugin.events)))
+    notice_types = sorted(
+        item["options"]["notice_type"] for item in _PLUGIN.plugin.events if item["options"].get("notice_type")
+    )
     check(
         "订阅 group_increase / group_decrease",
         notice_types == ["group_decrease", "group_increase"],
         str(notice_types),
     )
+    message_subs = [item for item in _PLUGIN.plugin.events if item["options"].get("post_type") == "message"]
+    check("订阅群消息（首句欢迎用）", len(message_subs) == 1, str(len(message_subs)))
     check("注册了命令", len(_PLUGIN.plugin.commands) == 1)
     command = _PLUGIN.plugin.commands[0]
     check("命令要权限 0", command["options"].get("permission") == 0, str(command["options"]))
@@ -506,6 +573,7 @@ async def main() -> int:
     await case_leave()
     await case_command()
     await case_official_ids()
+    await case_first_speak()
 
     print()
     if _FAILED:

@@ -11,8 +11,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -39,6 +42,7 @@ class GroupRule(BaseModel):
     enabled: bool = Field(default=True, description="这一群是否发送入群欢迎")
     template: str = Field(default="", description="这一群的欢迎语；留空沿用全局模板")
     leave_template: str = Field(default="", description="这一群的退群提示；留空沿用全局")
+    first_speak_template: str = Field(default="", description="这一群的「首次发言」欢迎语；留空沿用全局")
 
 
 class Config(BaseModel):
@@ -55,12 +59,23 @@ class Config(BaseModel):
     )
     leave_enabled: bool = Field(default=False, description="是否发送退群提示")
     leave_template: str = Field(default="{name} 离开了本群。", description="退群提示模板")
+    first_speak_enabled: bool = Field(
+        default=False,
+        description="官方通道没有入群事件，只能在他第一次发言时欢迎；开启后按「没见过的发言人」触发",
+    )
+    first_speak_template: str = Field(
+        default="", description="「首次发言」欢迎语；留空沿用上面的欢迎语模板"
+    )
+    first_speak_warmup_minutes: int = Field(
+        default=60,
+        description="启蒙期（分钟）：插件第一次见到某个群后的这段时间里只记录、不欢迎，避免给全群老人发欢迎",
+    )
     groups: list[GroupRule] = Field(default_factory=list, description="按群定制（每个群一条）")
 
 
 plugin = Plugin(
     "group_welcome",
-    version="1.1.0",
+    version="1.2.0",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -71,6 +86,17 @@ plugin = Plugin(
 _pending: dict[int, list[tuple[int, str]]] = {}
 _flush_tasks: dict[int, asyncio.Task] = {}
 _group_names: dict[int, str] = {}
+
+#: 首句欢迎的「已见成员」：{展示群号: {"users": {用户: 1}, "started": 时间戳}}
+_seen: dict[str, dict[str, Any]] = {}
+_seen_path: Path | None = None
+_seen_loaded = False
+#: 本群收到过多少条 notice 事件（诊断用，重启清零）
+_notice_count: dict[str, int] = {}
+
+_SEEN_VERSION = 1
+#: 单群最多记多少人，超出后按插入顺序丢最旧的
+_SEEN_MAX_USERS = 5000
 
 
 # ── 小工具 ────────────────────────────────────────────────────────
@@ -315,12 +341,128 @@ async def _send_now(ctx, group_id: int, template: str, members: list[tuple[int, 
     await _send(ctx, group_id, chain, "入群欢迎")
 
 
+# ── 首句欢迎（官方通道没有入群事件时的替代方案）──────────────────
+
+
+def _load_seen(path: Path | None) -> None:
+    global _seen_path, _seen_loaded
+    _seen_path = path
+    _seen_loaded = True
+    _seen.clear()
+    if path is None or not path.is_file():
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    groups = raw.get("groups") if isinstance(raw, dict) else None
+    if not isinstance(groups, dict):
+        return
+    for key, value in groups.items():
+        if not isinstance(value, dict):
+            continue
+        users = value.get("users")
+        _seen[str(key)] = {
+            "users": {str(uid): 1 for uid in users} if isinstance(users, dict) else {},
+            "started": float(value.get("started") or 0.0),
+        }
+
+
+def _save_seen() -> None:
+    if _seen_path is None:
+        return
+    try:
+        _seen_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = _seen_path.with_name(_seen_path.name + ".tmp")
+        payload = {"version": _SEEN_VERSION, "groups": _seen}
+        temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp.replace(_seen_path)
+    except Exception:
+        pass
+
+
+def _remember_user(group_key: str, user_key: str) -> bool:
+    """记下一个见过的发言人；返回是否是本次新记的。"""
+    state = _seen.get(group_key)
+    if state is None:
+        state = {"users": {}, "started": time.time()}
+        _seen[group_key] = state
+    users = state["users"]
+    if user_key in users:
+        return False
+    users[user_key] = 1
+    while len(users) > _SEEN_MAX_USERS:
+        users.pop(next(iter(users)))
+    return True
+
+
+def _bump_notice(event: dict[str, Any]) -> None:
+    key = str(event.get("group_id") or "")
+    if key:
+        _notice_count[key] = _notice_count.get(key, 0) + 1
+
+
+@plugin.event(post_type="message")
+async def on_group_message(event: dict[str, Any], ctx, config: Config) -> None:
+    """首句欢迎：官方通道拿不到入群事件，只能靠「没见过的发言人」近似。"""
+    if not config.first_speak_enabled:
+        return
+    try:
+        await _handle_first_speak(event, ctx, config)
+    except Exception as exc:
+        ctx.logger.warning(f"[group_welcome] 首句欢迎处理失败: {type(exc).__name__}: {exc}")
+
+
+async def _handle_first_speak(event: dict[str, Any], ctx, config: Config) -> None:
+    if str(event.get("message_type") or "") != "group":
+        return
+    group_id = _to_int(event.get("group_id"))
+    user_id = _to_int(event.get("user_id"))
+    if group_id is None or user_id is None:
+        return
+    if user_id == _to_int(event.get("self_id")):
+        return
+    rule = _rule_for(config, group_id)
+    if rule is not None and not rule.enabled:
+        return
+    template = (
+        rule.first_speak_template.strip()
+        if rule is not None and rule.first_speak_template.strip()
+        else config.first_speak_template.strip() or _effective_welcome(config, rule)
+    )
+    if not template:
+        return
+
+    group_key = _display_group_id(group_id)
+    user_key = _display_user_id(user_id)
+    state = _seen.get(group_key)
+    if state is None:
+        # 第一次见到这个群：只建档并记录当前发言人。否则会把全群老人挨个欢迎一遍。
+        _remember_user(group_key, user_key)
+        _save_seen()
+        ctx.logger.info(f"[group_welcome] 开始跟踪群 {group_key}，启蒙期内只记录不欢迎")
+        return
+
+    warmup = max(0, int(config.first_speak_warmup_minutes or 0)) * 60
+    if warmup and time.time() - float(state.get("started") or 0.0) < warmup:
+        if _remember_user(group_key, user_key):
+            _save_seen()
+        return
+
+    if not _remember_user(group_key, user_key):
+        return
+    _save_seen()
+    name = await _display_name(ctx, event, user_id, group_id)
+    await _send_now(ctx, group_id, template, [(user_id, name)])
+
+
 # ── 事件 ──────────────────────────────────────────────────────────
 
 
 @plugin.event(post_type="notice", notice_type="group_increase")
 async def on_group_increase(event: dict[str, Any], ctx, config: Config) -> None:
     """有人进群。"""
+    _bump_notice(event)
     try:
         await _handle_increase(event, ctx, config)
     except Exception as exc:
@@ -345,6 +487,10 @@ async def _handle_increase(event: dict[str, Any], ctx, config: Config) -> None:
         return
 
     name = await _display_name(ctx, event, user_id, group_id)
+    if config.first_speak_enabled:
+        # 入群时欢迎过的人，首句欢迎就别再喊一次
+        _remember_user(_display_group_id(group_id), _display_user_id(user_id))
+        _save_seen()
     delay = max(0.0, min(float(config.delay_seconds or 0.0), _MAX_DELAY))
     if delay > 0:
         _queue(ctx, group_id, template, user_id, name, delay)
@@ -355,6 +501,7 @@ async def _handle_increase(event: dict[str, Any], ctx, config: Config) -> None:
 @plugin.event(post_type="notice", notice_type="group_decrease")
 async def on_group_decrease(event: dict[str, Any], ctx, config: Config) -> None:
     """有人退群 / 被踢。"""
+    _bump_notice(event)
     try:
         await _handle_decrease(event, ctx, config)
     except Exception as exc:
@@ -414,6 +561,19 @@ def _status_text(config: Config, group_id: int) -> str:
         f"合并窗口：{float(config.delay_seconds or 0.0):g} 秒",
         f"退群提示：{'开' if config.leave_enabled else '关'} → {leave or '（空）'}",
     ]
+    group_key = _display_group_id(group_id)
+    state = _seen.get(group_key) or {}
+    seen_count = len(state.get("users") or {})
+    warmup = max(0, int(config.first_speak_warmup_minutes or 0)) * 60
+    left = 0
+    if state.get("started") and warmup:
+        left = max(0, int(warmup - (time.time() - float(state["started"]))))
+    lines.append(
+        f"首句欢迎：{'开' if config.first_speak_enabled else '关'}（已记录 {seen_count} 人"
+        + (f"，启蒙期剩 {left // 60} 分钟" if left else "")
+        + "）"
+    )
+    lines.append(f"本群 notice 事件：{_notice_count.get(str(group_id), 0)} 条（官方通道恒为 0）")
     return "\n".join(lines)
 
 
@@ -451,6 +611,11 @@ async def welcome_command(
     if text in {"状态", "查看", "status"}:
         return _status_text(config, group_id)
 
+    if text in {"重置", "reset"}:
+        _seen.pop(_display_group_id(group_id), None)
+        _save_seen()
+        return "已清空本群的首句欢迎记录，接下来会重新进入启蒙期。"
+
     return _HELP
 
 
@@ -459,6 +624,8 @@ async def welcome_command(
 
 @plugin.on_load
 async def on_load(ctx) -> None:
+    data_dir = getattr(ctx, "data_dir", None)
+    _load_seen(Path(data_dir) / "seen.json" if data_dir is not None else None)
     ctx.logger.info("[group_welcome] 已加载：入群欢迎 + 退群提示")
 
 
@@ -468,4 +635,5 @@ async def on_shutdown(ctx) -> None:
         task.cancel()
     _flush_tasks.clear()
     _pending.clear()
+    _save_seen()
     ctx.logger.info("[group_welcome] 已停止")
