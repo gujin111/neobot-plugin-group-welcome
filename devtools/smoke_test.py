@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import itertools
+import json
 import shutil
 import sys
 import tomllib
@@ -891,6 +892,29 @@ async def case_official_render() -> None:
     )
     text2 = ctx2.sent[0][1].plain() if ctx2.sent else ""
     check("昵称缓存能落盘复用", "小明" in text2, text2)
+
+    # 4) 入群时从成员资料接口学到的昵称，也要立刻落盘
+    join_group = "AAAA0000BBBB1111"
+    join_user = "CCCC2222DDDD3333"
+    ctx3 = FakeCtx(profiles={join_user: FakeProfile(join_user, nickname="阿强")})
+    await _PLUGIN.on_load(ctx3)
+    await _PLUGIN.on_group_increase(
+        {"post_type": "notice", "notice_type": "group_increase", "group_id": join_group, "user_id": join_user},
+        ctx3,
+        make_config(template="欢迎 {at}"),
+    )
+    saved = json.loads((ctx3.data_dir / "seen.json").read_text(encoding="utf-8"))
+    check("入群学到的昵称已落盘", saved.get("names", {}).get(join_user) == "阿强", str(saved.get("names"))[:90])
+
+    ctx4 = FakeCtx(data_dir=ctx3.data_dir)
+    await _PLUGIN.on_load(ctx4)
+    await _PLUGIN.on_group_decrease(
+        {"post_type": "notice", "notice_type": "group_decrease", "group_id": join_group, "user_id": join_user},
+        ctx4,
+        make_config(leave_enabled=True),
+    )
+    text4 = ctx4.sent[0][1].plain() if ctx4.sent else ""
+    check("重启后没说过话也能显示昵称", "阿强" in text4, text4)
 
 
 async def main() -> int:

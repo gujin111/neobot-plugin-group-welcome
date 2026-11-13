@@ -80,7 +80,7 @@ class Config(BaseModel):
 
 plugin = Plugin(
     "group_welcome",
-    version="1.8.0",
+    version="1.8.1",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -685,9 +685,11 @@ async def _welcome_member(
 
     # 记进名册：轮询看到这人已在册就不会再欢迎一次
     _remember_user(_display_group_id(group_id), _display_user_id(user_id))
-    _save_seen()
 
+    # 昵称也在这里解析：入群事件本身不带昵称，但成员资料接口往往能给到；
+    # 解析完立刻落盘，之后退群（人已不在群里、接口查不到）才有名字可用。
     name = await _display_name(ctx, event, user_id, group_id)
+    _save_seen()
     delay = max(0.0, min(float(config.delay_seconds or 0.0), _MAX_DELAY))
     if delay > 0:
         _queue(ctx, group_id, template, user_id, name, delay)
