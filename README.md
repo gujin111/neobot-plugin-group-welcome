@@ -129,6 +129,9 @@ NeoBot 2.1.0a8 起，新部署默认走 QQ 官方机器人通道（`adapter.mode
 1. **配置照旧写真实群号**。`groups[].group_id = 123456789` 在官方通道下也能命中：插件通过宿主的 `neobot_app.user_identity` 把进来的合成群号反查成真实群号再比对，写合成 ID 也能匹配。
 2. **展示自动用真实号**。`{group_id}`、`{id}`、`/欢迎 状态` 都优先显示绑定后的真实号，没绑定才显示合成号；想拿原始 ID 用 `{raw_group_id}` / `{raw_id}`。
 3. **`{at}` 始终用合成 ID 发**——官方协议只认 openid，这是对的，别改成真实号。
+4. **会话 ID 认 openid**。命令不写死 `int(group_id)`：优先用宿主 `CommandContext.conv_id`，
+   再按 `group_id` / `group_openid` / `chat_id` / `conversation_id` 兜底。所以
+   `groups[].group_id` 直接填 `455C4F9FA90747F3E4CAFA601C97C7F7` 这种 openid 也能命中。
 
 绑定方法（宿主内置，一次一个群）：
 
@@ -138,6 +141,9 @@ NeoBot 2.1.0a8 起，新部署默认走 QQ 官方机器人通道（`adapter.mode
 ```
 
 映射存在 `data/user_qq_map.json`，绑定后 `/欢迎 状态` 会显示「已绑定真实群号 xxx」。
+
+> 如果 `/欢迎` 仍然回「这个命令只能在群里用」，那是真的没拿到会话 ID：日志里会打一行
+> `无法确定当前会话：event keys=[…] conv_id=… kind=…`，把那行发我，照着补映射即可。
 
 > ⚠️ **必须先知道的一件事**：官方通道**不推送群成员变动事件**。
 > `packages/adapter/src/neobot_adapter/official/events.py` 里 `MESSAGE_EVENTS` 只有

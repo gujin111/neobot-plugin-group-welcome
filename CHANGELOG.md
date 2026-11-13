@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.1 — 2026-11-13
+
+修官方通道 `/欢迎` 误报「这个命令只能在群里用」。
+
+- 根因：命令里只认 `event["group_id"]` 并强制 `int()`；官方通道的会话 ID 是
+  `455C4F9F…` 这类 openid，转换失败就被当成「不在群里」
+- `welcome_command` 改为优先取宿主 `CommandContext.conv_id`（宿主自己回复也用它，
+  一定是可发送的会话 ID），再按 `group_id` / `group_openid` / `chat_id` /
+  `conversation_id` 依次兜底
+- 新增 `_as_id`：纯数字转 int，openid 这类字符串原样保留；`groups[].group_id`
+  现在也接受 openid，匹配时按字符串比较
+- 确实拿不到会话 ID 时，日志会打出 event keys / conv_id / kind，方便定位
+
 ## 1.5.0 — 2026-11-12
 
 把「官方通道欢迎」从「首句发言近似」改成**自己检测入群**：

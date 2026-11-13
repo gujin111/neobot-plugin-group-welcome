@@ -38,7 +38,10 @@ _MAX_DELAY = 600.0
 class GroupRule(BaseModel):
     """单个群的定制项；``group_id`` 留 0 表示这一条不生效。"""
 
-    group_id: int = Field(default=0, description="群号，写纯数字，例如 123456789")
+    group_id: int | str = Field(
+        default=0,
+        description="群号（纯数字）；官方通道也可以直接填 openid 那串十六进制。留 0 表示这条不生效",
+    )
     enabled: bool = Field(default=True, description="这一群是否发送入群欢迎")
     template: str = Field(default="", description="这一群的欢迎语；留空沿用全局模板")
     leave_template: str = Field(default="", description="这一群的退群提示；留空沿用全局")
@@ -72,7 +75,7 @@ class Config(BaseModel):
 
 plugin = Plugin(
     "group_welcome",
-    version="1.5.0",
+    version="1.5.1",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -106,6 +109,23 @@ def _to_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_id(value: Any) -> int | str | None:
+    """会话 ID：纯数字转 int，其余（官方 openid 这类十六进制串）原样保留。
+
+    官方通道的 ``group_openid`` 不是数字，早期版本直接扔给 ``int()`` 会得到 None，
+    于是所有「这是哪个群」的判断全部失效（命令会误报「只能在群里用」）。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
 
 
 def _identity_module() -> Any:
@@ -156,15 +176,14 @@ def _display_user_id(user_id: Any) -> str:
     return str(_real_user_id(user_id) or user_id)
 
 
-def _rule_for(config: Config, group_id: int) -> GroupRule | None:
-    """按群命中规则；``groups[].group_id`` 写真实群号或合成 ID 都能匹配。"""
-    candidates = {group_id, _real_group_number(group_id)}
+def _rule_for(config: Config, group_id: Any) -> GroupRule | None:
+    """按群命中规则；写真实群号、合成 ID 或官方 openid 都能匹配。"""
+    candidates = {str(group_id).strip()}
+    real = _real_group_number(group_id)
+    if real is not None:
+        candidates.add(str(real))
     for rule in config.groups or ():
-        try:
-            number = int(rule.group_id)
-        except (TypeError, ValueError):
-            continue
-        if number in candidates:
+        if str(rule.group_id).strip() in candidates:
             return rule
     return None
 
@@ -199,7 +218,7 @@ def _pick(data: Any, *keys: str) -> str:
 
 
 async def _display_name(
-    ctx, event: dict[str, Any] | None, user_id: int, group_id: int
+    ctx, event: dict[str, Any] | None, user_id: int, group_id: Any
 ) -> str:
     """优先用群名片，其次昵称，最后退回 QQ 号。轮询路径没有事件，event 传 None。"""
     if event:
@@ -211,7 +230,9 @@ async def _display_name(
         except Exception:
             pass
     try:
-        profile = await ctx.users.get(str(user_id), group_id=str(group_id))
+        profile = await ctx.users.get(
+            str(user_id), group_id=str(group_id) if isinstance(group_id, int) else None
+        )
         name = (profile.card or profile.nickname or "").strip()
         if name:
             return name
@@ -220,9 +241,10 @@ async def _display_name(
     return str(user_id)
 
 
-async def _group_name(ctx, group_id: int) -> str:
+async def _group_name(ctx, group_id: Any) -> str:
     """群名查一次就缓存；拿不到就退回群号，绝不让它拖垮欢迎语。"""
-    cached = _group_names.get(group_id)
+    cache_key = str(group_id)
+    cached = _group_names.get(cache_key)
     if cached:
         return cached
     name = ""
@@ -233,7 +255,7 @@ async def _group_name(ctx, group_id: int) -> str:
         except Exception:
             name = ""
     name = name or _display_group_id(group_id)
-    _group_names[group_id] = name
+    _group_names[cache_key] = name
     return name
 
 
@@ -254,7 +276,7 @@ def _compose(template: str, values: dict[str, str], user_ids: list[int]) -> Mess
 async def _build_chain(
     ctx,
     template: str,
-    group_id: int,
+    group_id: Any,
     members: list[tuple[int, str]],
 ) -> MessageChain:
     user_ids = [uid for uid, _ in members]
@@ -287,7 +309,7 @@ async def _build_chain(
     return _compose(template, values, user_ids)
 
 
-async def _send(ctx, group_id: int, chain: MessageChain, what: str) -> None:
+async def _send(ctx, group_id: Any, chain: MessageChain, what: str) -> None:
     try:
         await ctx.send_group(group_id, chain)
     except Exception as exc:  # 被禁言、被踢、风控……都不该把事件分发打挂
@@ -297,7 +319,7 @@ async def _send(ctx, group_id: int, chain: MessageChain, what: str) -> None:
 # ── 合并进群 ──────────────────────────────────────────────────────
 
 
-def _queue(ctx, group_id: int, template: str, user_id: int, name: str, delay: float) -> None:
+def _queue(ctx, group_id: Any, template: str, user_id: int, name: str, delay: float) -> None:
     members = _pending.setdefault(group_id, [])
     for index, (uid, _old) in enumerate(members):
         if uid == user_id:
@@ -325,7 +347,7 @@ def _queue(ctx, group_id: int, template: str, user_id: int, name: str, delay: fl
             ctx.create_task(_send_now(ctx, group_id, template, members))
 
 
-async def _flush_later(ctx, group_id: int, template: str, delay: float) -> None:
+async def _flush_later(ctx, group_id: Any, template: str, delay: float) -> None:
     if delay > 0:
         await asyncio.sleep(delay)
     members = _pending.pop(group_id, [])
@@ -334,7 +356,7 @@ async def _flush_later(ctx, group_id: int, template: str, delay: float) -> None:
         await _send_now(ctx, group_id, template, members)
 
 
-async def _send_now(ctx, group_id: int, template: str, members: list[tuple[int, str]]) -> None:
+async def _send_now(ctx, group_id: Any, template: str, members: list[tuple[int, str]]) -> None:
     chain = await _build_chain(ctx, template, group_id, members)
     if len(chain) == 0:  # 模板渲染成空串（例如只剩空白），别发空消息
         return
@@ -607,7 +629,7 @@ _HELP = (
 )
 
 
-def _status_text(config: Config, group_id: int) -> str:
+def _status_text(config: Config, group_id: Any) -> str:
     rule = _rule_for(config, group_id)
     template = _effective_welcome(config, rule)
     leave = _effective_leave(config, rule)
@@ -636,6 +658,29 @@ def _status_text(config: Config, group_id: int) -> str:
     return "\n".join(lines)
 
 
+_GROUP_KINDS = {"group", "guild", "channel", "group_chat", "guild_group"}
+
+
+def _resolve_group_id(event: dict[str, Any], command_context: Any = None) -> int | str | None:
+    """命令里确定「当前是哪个群」。
+
+    宿主命令路径会把 ``CommandContext`` 塞进 captures：官方通道下 ``conv_id`` 才是
+    可靠且可发送的会话 ID（可能是 ``455C4F9F…`` 这样的 openid，也可能是 13 位合成号），
+    事件里的 ``group_id`` 有可能缺失、也可能不是数字。
+    """
+    if command_context is not None:
+        kind = str(getattr(command_context, "kind", "") or "")
+        if kind in _GROUP_KINDS:
+            conv = _as_id(getattr(command_context, "conv_id", None))
+            if conv is not None:
+                return conv
+    for key in ("group_id", "group_openid", "chat_id", "conversation_id", "conv_id", "guild_id"):
+        conv = _as_id(event.get(key))
+        if conv is not None:
+            return conv
+    return None
+
+
 @plugin.command(
     "欢迎 [action:rest]",
     permission=0,
@@ -647,11 +692,17 @@ async def welcome_command(
     event: dict[str, Any],
     ctx,
     config: Config,
+    command_context=None,
 ) -> str | None:
     text = (action or "").strip()
-    group_id = _to_int(event.get("group_id"))
+    group_id = _resolve_group_id(event, command_context)
     if group_id is None:
-        return "这个命令只能在群里用。"
+        ctx.logger.warning(
+            f"[group_welcome] 无法确定当前会话：event keys={sorted(event.keys())} "
+            f"conv_id={getattr(command_context, 'conv_id', None)!r} "
+            f"kind={getattr(command_context, 'kind', None)!r}"
+        )
+        return "这个命令只能在群里用（没拿到群/会话 ID，已写入日志）。"
 
     if text in {"预览", "preview", "测试"}:
         rule = _rule_for(config, group_id)

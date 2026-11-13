@@ -262,7 +262,7 @@ class FakeCtx:
         self.tasks: list[asyncio.Task] = []
 
     async def send_group(self, group_id, chain):
-        self.sent.append((int(group_id), chain))
+        self.sent.append((group_id, chain))
 
     def create_task(self, coroutine, *, name=None):
         task = asyncio.create_task(coroutine, name=name)
@@ -434,6 +434,14 @@ async def case_leave() -> None:
     check("机器人被踢不发", len(ctx3.sent) == 0)
 
 
+class FakeCommandContext:
+    """宿主命令上下文的最小子集：kind + conv_id。"""
+
+    def __init__(self, kind="group", conv_id=""):
+        self.kind = kind
+        self.conv_id = conv_id
+
+
 async def case_command() -> None:
     print("命令：状态 / 预览 / 帮助")
     ctx = FakeCtx(profiles={"123": FakeProfile("123", nickname="小明")})
@@ -565,6 +573,46 @@ async def case_join_poll() -> None:
     check("按 groups 里的群轮询", len(ctx5.sent) == 0 and (_PLUGIN._seen.get("555") is not None), str(_PLUGIN._seen.keys()))
 
 
+async def case_official_command() -> None:
+    print("官方通道：/欢迎 的会话 ID 解析")
+    openid = "455C4F9FA90747F3E4CAFA601C97C7F7"
+    ctx = FakeCtx(profiles={"123": FakeProfile("123", nickname="小明")})
+    config = make_config()
+    command_context = FakeCommandContext(kind="group", conv_id=openid)
+
+    status = await _PLUGIN.welcome_command(
+        "状态", {"group_openid": openid, "sender_id": "EF5B"}, ctx, config, command_context
+    )
+    check("官方通道不再误报只能在群里用", "只能在群里用" not in (status or ""), str(status)[:60])
+    check("状态里带出会话 ID", openid in (status or ""), str(status)[:120])
+
+    await _PLUGIN.welcome_command(
+        "预览", {"group_openid": openid, "user_id": 123}, ctx, config, command_context
+    )
+    check("预览按会话 ID 发送", len(ctx.sent) == 1 and ctx.sent[0][0] == openid, str(ctx.sent)[:90])
+
+    ctx2 = FakeCtx(profiles={"123": FakeProfile("123")})
+    status2 = await _PLUGIN.welcome_command("状态", {"group_openid": openid}, ctx2, config, None)
+    check("事件里只有 openid 也能定位", "只能在群里用" not in (status2 or ""), str(status2)[:60])
+
+    ctx3 = FakeCtx()
+    private = await _PLUGIN.welcome_command(
+        "状态", {"user_id": 123}, ctx3, config, FakeCommandContext(kind="private", conv_id="123")
+    )
+    check("私聊仍然提示只能在群里用", "只能在群里用" in (private or ""), str(private)[:60])
+
+    rule = _PLUGIN.GroupRule(group_id=openid, template="定制 {at}")
+    ctx4 = FakeCtx(profiles={"123": FakeProfile("123")})
+    await _PLUGIN.welcome_command(
+        "预览",
+        {"group_openid": openid, "user_id": 123},
+        ctx4,
+        make_config(groups=[rule]),
+        FakeCommandContext(conv_id=openid),
+    )
+    check("groups 里写 openid 也能命中", "定制" in ctx4.sent[0][1].plain(), ctx4.sent[0][1].plain())
+
+
 async def main() -> int:
     global _PLUGIN
     _PLUGIN = load_plugin()
@@ -598,6 +646,7 @@ async def main() -> int:
     await case_switches()
     await case_leave()
     await case_command()
+    await case_official_command()
     await case_official_ids()
     await case_join_poll()
 
