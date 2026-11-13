@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.0 — 2026-11-13
+
+修官方通道两个观感问题：欢迎语没有 @、退群显示一串 openid。
+
+- **官方通道的 @ 改走 Markdown**：官方纯文本消息（`msg_type=0`）发不出真正的 @，
+  适配器会直接丢弃 `at` 段（`official/send.py`）。现在检测到 ID 是 openid 字符串且
+  模板含 `{at}` 时，发 `official_markdown` 段，内容里用 `<qqbot-at-user id="openid" />`；
+  发送失败自动回退纯文本（不报错、不刷屏）
+- **昵称缓存**：新增 `_names`（持久化在 `seen.json` 的 `names` 字段），
+  从群消息的 `sender.nickname/card`、入群事件、成员资料接口三处收集；
+  退群事件只有 openid（人已退群、接口查不到）时用它补 `{name}`
+- 事件订阅新增 `post_type="message"`（只记昵称，不回复、不拦截）
+
 ## 1.7.0 — 2026-11-13
 
 适配 NeoBot **2.1.0a9**（官方通道改为直出 openid 字符串 + 原生成员事件）。

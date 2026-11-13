@@ -1,5 +1,5 @@
 name = "group_welcome"
-version = "1.7.0"
+version = "1.8.0"
 description = "入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员"
 author = "NeoBot 第三方插件"
 license = "MIT"

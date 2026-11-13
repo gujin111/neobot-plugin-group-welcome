@@ -80,7 +80,7 @@ class Config(BaseModel):
 
 plugin = Plugin(
     "group_welcome",
-    version="1.7.0",
+    version="1.8.0",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -222,28 +222,60 @@ def _pick(data: Any, *keys: str) -> str:
     return ""
 
 
+#: 昵称缓存：{用户 ID: 昵称}。官方通道的退群事件不带昵称，只能靠这里补。
+_names: dict[str, str] = {}
+
+
+def _accept_name(user_key: str, name: str) -> bool:
+    text = str(name or "").strip()
+    return bool(text) and text != user_key and not text.startswith("QQ:")
+
+
+def _remember_name(user_key: str, name: str) -> bool:
+    text = str(name or "").strip()
+    if not _accept_name(user_key, text):
+        return False
+    if _names.get(user_key) == text:
+        return False
+    _names[user_key] = text
+    return True
+
+
 async def _display_name(
     ctx, event: dict[str, Any] | None, user_id: Any, group_id: Any
 ) -> str:
-    """优先用群名片，其次昵称，最后退回 QQ 号。轮询路径没有事件，event 传 None。"""
+    """事件 sender → 本地昵称缓存 → 成员资料接口 → 最后才退回 ID。
+
+    官方通道的退群事件只给 openid（人已经退群，接口也查不到），所以平时要把
+    说话人/入群者的昵称记下来，退群时才有名字可用。
+    """
+    key = str(user_id)
     if event:
+        sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
+        name = str(sender.get("card") or sender.get("nickname") or "").strip()
+        if _accept_name(key, name):
+            _remember_name(key, name)
+            return name
         try:
             profile = ctx.users.from_event(event)
             name = (getattr(profile, "card", None) or getattr(profile, "nickname", None) or "").strip()
-            if name:
+            if _accept_name(key, name):
+                _remember_name(key, name)
                 return name
         except Exception:
             pass
+    cached = _names.get(key)
+    if cached:
+        return cached
     try:
-        profile = await ctx.users.get(
-            str(user_id), group_id=str(group_id) if isinstance(group_id, int) else None
-        )
+        profile = await ctx.users.get(str(user_id), group_id=str(group_id))
         name = (profile.card or profile.nickname or "").strip()
-        if name:
+        if _accept_name(key, name):
+            _remember_name(key, name)
             return name
     except Exception:
         pass
-    return str(user_id)
+    return _names.get(key) or str(user_id)
 
 
 async def _group_name(ctx, group_id: Any) -> str:
@@ -278,12 +310,23 @@ def _compose(template: str, values: dict[str, str], user_ids: list[Any]) -> Mess
     return chain
 
 
-async def _build_chain(
+def _compose_markdown(template: str, values: dict[str, str], user_ids: list[Any]) -> str:
+    """官方通道用：``{at}`` 渲染成 ``<qqbot-at-user id="..."/>``。
+
+    官方纯文本消息（msg_type=0）发不出真正的 @，at 段会被适配器直接丢弃；
+    只有 Markdown 消息（msg_type=2）才认内嵌 @。
+    """
+    local = dict(values)
+    local["at"] = "".join(f'<qqbot-at-user id="{uid}" />' for uid in user_ids)
+    return _PLACEHOLDER.sub(lambda m: local.get(m.group(1), m.group(0)), template)
+
+
+async def _template_values(
     ctx,
     template: str,
     group_id: Any,
     members: list[tuple[Any, str]],
-) -> MessageChain:
+) -> tuple[dict[str, str], list[Any]]:
     user_ids = [uid for uid, _ in members]
     names = [name for _, name in members]
     now = datetime.now()
@@ -295,11 +338,11 @@ async def _build_chain(
         "name": "、".join(names),
         "user": "、".join(names),
         "nickname": "、".join(names),
-        # 展示用：官方通道下映射得到真实 QQ，没绑定则是合成号
+        # 展示用：官方通道下映射得到真实 QQ，没绑定则是原始 ID
         "id": "、".join(display_ids),
         "user_id": "、".join(display_ids),
         "qq_id": "、".join(display_ids),
-        # 通道原始 ID（官方通道是 13 位合成号 / openid，OneBot 就是真号）
+        # 通道原始 ID（官方通道是 openid / 13 位合成号，OneBot 就是真号）
         "raw_id": "、".join(str(uid) for uid in user_ids),
         "group": group_name,
         "group_name": group_name,
@@ -311,7 +354,27 @@ async def _build_chain(
         "bot": str(getattr(getattr(ctx, "adapter", None), "self_id", "") or ""),
         "br": "\n",
     }
+    return values, user_ids
+
+
+async def _build_chain(
+    ctx,
+    template: str,
+    group_id: Any,
+    members: list[tuple[Any, str]],
+) -> MessageChain:
+    values, user_ids = await _template_values(ctx, template, group_id, members)
     return _compose(template, values, user_ids)
+
+
+async def _build_markdown(
+    ctx,
+    template: str,
+    group_id: Any,
+    members: list[tuple[Any, str]],
+) -> str:
+    values, user_ids = await _template_values(ctx, template, group_id, members)
+    return _compose_markdown(template, values, user_ids)
 
 
 async def _send(ctx, group_id: Any, chain: MessageChain, what: str) -> None:
@@ -362,6 +425,24 @@ async def _flush_later(ctx, group_id: Any, template: str, delay: float) -> None:
 
 
 async def _send_now(ctx, group_id: Any, template: str, members: list[tuple[Any, str]]) -> None:
+    user_ids = [uid for uid, _ in members]
+    # 官方通道（ID 是 openid 字符串）纯文本发不出 @，得走 Markdown 卡片
+    official_like = any(isinstance(uid, str) for uid in user_ids) or isinstance(group_id, str)
+    if official_like and "{at}" in template:
+        markdown = await _build_markdown(ctx, template, group_id, members)
+        if markdown.strip():
+            try:
+                await ctx.send_group(
+                    group_id,
+                    MessageChain().segment(
+                        {"type": "official_markdown", "data": {"content": markdown}}
+                    ),
+                )
+                return
+            except Exception as exc:
+                ctx.logger.warning(
+                    f"[group_welcome] 官方 Markdown 发送失败，回退纯文本: {type(exc).__name__}: {exc}"
+                )
     chain = await _build_chain(ctx, template, group_id, members)
     if len(chain) == 0:  # 模板渲染成空串（例如只剩空白），别发空消息
         return
@@ -376,13 +457,22 @@ def _load_seen(path: Path | None) -> None:
     _seen_path = path
     _seen_loaded = True
     _seen.clear()
+    _names.clear()
     if path is None or not path.is_file():
         return
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return
-    groups = raw.get("groups") if isinstance(raw, dict) else None
+    if not isinstance(raw, dict):
+        return
+    names = raw.get("names")
+    if isinstance(names, dict):
+        for key, value in names.items():
+            text = str(value or "").strip()
+            if text:
+                _names[str(key)] = text
+    groups = raw.get("groups")
     if not isinstance(groups, dict):
         return
     for key, value in groups.items():
@@ -401,7 +491,7 @@ def _save_seen() -> None:
     try:
         _seen_path.parent.mkdir(parents=True, exist_ok=True)
         temp = _seen_path.with_name(_seen_path.name + ".tmp")
-        payload = {"version": _SEEN_VERSION, "groups": _seen}
+        payload = {"version": _SEEN_VERSION, "groups": _seen, "names": _names}
         temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         temp.replace(_seen_path)
     except Exception:
@@ -532,6 +622,24 @@ async def _poll_loop(ctx, config: Config) -> None:
 
 
 # ── 事件 ──────────────────────────────────────────────────────────
+
+
+@plugin.event(post_type="message")
+async def on_message(event: dict[str, Any], ctx) -> None:
+    """只做一件事：把说话人的昵称记下来。
+
+    官方通道的退群事件只带 openid、人又已经不在群里，事后查不到昵称；
+    平时把见过的昵称缓存起来，退群文案才能写出人名而不是一串十六进制。
+    """
+    if str(event.get("message_type") or "") != "group":
+        return
+    user_id = event.get("user_id")
+    if user_id is None:
+        return
+    sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
+    name = str(sender.get("card") or sender.get("nickname") or "").strip()
+    if _remember_name(str(user_id), name):
+        _save_seen()
 
 
 @plugin.event(post_type="notice", notice_type="group_increase")

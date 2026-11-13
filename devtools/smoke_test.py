@@ -97,6 +97,13 @@ class FakeChain:
         self.parts.append(("at", str(user_id)))
         return self
 
+    def segment(self, segment) -> "FakeChain":
+        data = dict(segment or {})
+        kind = str(data.get("type") or "")
+        content = str((data.get("data") or {}).get("content") or "")
+        self.parts.append((kind, content))
+        return self
+
     def plain(self) -> str:
         """只拼文字段；at 段单独用 ats() 断言。"""
         return "".join(value for kind, value in self.parts if kind == "text")
@@ -756,7 +763,17 @@ async def case_a9_official_notice() -> None:
     )
     check("openid 入群事件能触发欢迎", len(ctx.sent) == 1, str(len(ctx.sent)))
     check("欢迎发到 openid 群", ctx.sent and ctx.sent[0][0] == group, str(ctx.sent)[:80])
-    check("@ 段用 openid", ctx.sent and ctx.sent[0][1].ats() == [user], str(ctx.sent[0][1].ats()))
+    parts = ctx.sent[0][1].parts if ctx.sent else []
+    check(
+        "官方通道改发 markdown 段",
+        bool(parts) and parts[0][0] == "official_markdown",
+        str(parts)[:100],
+    )
+    check(
+        "markdown 里内嵌 @openid",
+        bool(parts) and f'<qqbot-at-user id="{user}" />' in parts[0][1],
+        (parts[0][1][:120] if parts else ""),
+    )
 
     ctx2 = FakeCtx(profiles={user: FakeProfile(user, nickname="小明")})
     await _PLUGIN.on_group_decrease(
@@ -796,7 +813,84 @@ async def case_a9_official_notice() -> None:
         ctx4,
         make_config(groups=[rule]),
     )
-    check("按群规则（openid）命中", "定制" in ctx4.sent[0][1].plain(), ctx4.sent[0][1].plain())
+    parts4 = ctx4.sent[0][1].parts if ctx4.sent else []
+    check(
+        "按群规则（openid）命中",
+        bool(parts4) and "定制" in parts4[0][1],
+        str(parts4)[:100],
+    )
+
+
+class FlakyCtx(FakeCtx):
+    """第一次 send_group 抛错，用来验证 Markdown 失败后的纯文本回退。"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.fail_next = True
+
+    async def send_group(self, group_id, chain):
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("markdown rejected")
+        await super().send_group(group_id, chain)
+
+
+async def case_official_render() -> None:
+    print("官方通道：Markdown @ 与退群昵称")
+    group = "455C4F9FA90747F3E4CAFA601C97C7F7"
+    user = "EF5BFAF8C4B14899F39398E9E132D0BD"
+
+    # 1) Markdown 发送失败 → 回退纯文本（@ 丢失但不报错）
+    flaky = FlakyCtx()
+    await _PLUGIN.on_group_increase(
+        {"post_type": "notice", "notice_type": "group_increase", "group_id": group, "user_id": user},
+        flaky,
+        make_config(template="欢迎 {at} 加入本群"),
+    )
+    check("Markdown 失败后回退纯文本", len(flaky.sent) == 1, str(len(flaky.sent)))
+    check(
+        "回退时发的是纯文本链",
+        bool(flaky.sent) and flaky.sent[0][1].parts[0][0] == "text",
+        str(flaky.sent[0][1].parts)[:80],
+    )
+    check(
+        "回退文案仍完整",
+        flaky.sent and "加入本群" in flaky.sent[0][1].plain(),
+        flaky.sent[0][1].plain() if flaky.sent else "",
+    )
+
+    # 2) 平时记昵称 → 退群时用昵称而不是 openid
+    ctx = FakeCtx()
+    await _PLUGIN.on_load(ctx)
+    await _PLUGIN.on_message(
+        {
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": group,
+            "user_id": user,
+            "sender": {"user_id": user, "nickname": "小明", "card": ""},
+        },
+        ctx,
+    )
+    await _PLUGIN.on_group_decrease(
+        {"post_type": "notice", "notice_type": "group_decrease", "group_id": group, "user_id": user},
+        ctx,
+        make_config(leave_enabled=True),
+    )
+    text = ctx.sent[0][1].plain() if ctx.sent else ""
+    check("退群显示昵称", "小明" in text, text)
+    check("退群不再出现 openid", user not in text, text)
+
+    # 3) 昵称缓存持久化：重启后仍可用
+    ctx2 = FakeCtx(data_dir=ctx.data_dir)
+    await _PLUGIN.on_load(ctx2)
+    await _PLUGIN.on_group_decrease(
+        {"post_type": "notice", "notice_type": "group_decrease", "group_id": group, "user_id": user},
+        ctx2,
+        make_config(leave_enabled=True),
+    )
+    text2 = ctx2.sent[0][1].plain() if ctx2.sent else ""
+    check("昵称缓存能落盘复用", "小明" in text2, text2)
 
 
 async def main() -> int:
@@ -807,7 +901,7 @@ async def main() -> int:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
     check("插件名", _PLUGIN.plugin.name == "group_welcome", _PLUGIN.plugin.name)
-    check("注册了 2 个事件订阅", len(_PLUGIN.plugin.events) == 2, str(len(_PLUGIN.plugin.events)))
+    check("注册了 3 个事件订阅", len(_PLUGIN.plugin.events) == 3, str(len(_PLUGIN.plugin.events)))
     notice_types = sorted(
         item["options"]["notice_type"] for item in _PLUGIN.plugin.events if item["options"].get("notice_type")
     )
@@ -835,6 +929,7 @@ async def main() -> int:
     await case_official_command()
     await case_help_card()
     await case_a9_official_notice()
+    await case_official_render()
     await case_official_ids()
     await case_join_poll()
 
