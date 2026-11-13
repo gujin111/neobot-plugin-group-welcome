@@ -127,20 +127,28 @@ enabled = false        # 这个群不欢迎，也不发退群
 > 发送优先走 `CommandContext.service.send_image_bytes`（与宿主 `/help` 同一条链路，官方通道也能发），
 > 失败退 `Reply.image`，再失败回退纯文本。Chromium 没起来时就一直是文字版，命令不会报错。
 
-## 官方机器人通道（13 位合成 ID）
+## 官方机器人通道（openid / 合成 ID）
 
-NeoBot 2.1.0a8 起，新部署默认走 QQ 官方机器人通道（`adapter.mode = official`）。官方只给 openid，NeoBot 换成 13 位合成号（群 `9.5T…`、用户 `9.0T…`），和真实群号/QQ 号**没有任何 API 能互转**，只能人工绑定。
+官方适配器的 ID 形态随版本变过：
 
-本插件对这件事的处理：
+| 版本 | 事件里的群/用户 ID |
+| --- | --- |
+| 2.1.0a8 及更早 | 13 位合成号（群 `9.5T…`、用户 `9.0T…`），由 `IdentityMap` 从 openid 生成 |
+| **2.1.0a9+（当前最新）** | **直接是 openid 字符串**（`455C4F9F…`），`IdentityMap` 降级为只读迁移 |
 
-1. **配置照旧写真实群号**。`groups[].group_id = 123456789` 在官方通道下也能命中：插件通过宿主的 `neobot_app.user_identity` 把进来的合成群号反查成真实群号再比对，写合成 ID 也能匹配。
-2. **展示自动用真实号**。`{group_id}`、`{id}`、`/欢迎 状态` 都优先显示绑定后的真实号，没绑定才显示合成号；想拿原始 ID 用 `{raw_group_id}` / `{raw_id}`。
-3. **`{at}` 始终用合成 ID 发**——官方协议只认 openid，这是对的，别改成真实号。
-4. **会话 ID 认 openid**。命令不写死 `int(group_id)`：优先用宿主 `CommandContext.conv_id`，
-   再按 `group_id` / `group_openid` / `chat_id` / `conversation_id` 兜底。所以
-   `groups[].group_id` 直接填 `455C4F9FA90747F3E4CAFA601C97C7F7` 这种 openid 也能命中。
+本插件两种都认：
 
-绑定方法（宿主内置，一次一个群）：
+1. **ID 统一走 `_as_id()`**：纯数字转 `int`，其余（openid）原样保留字符串。事件、轮询、
+   命令三条路径共用，不会再出现 `int("455C…")` 失败导致的静默丢弃。
+2. **`groups[].group_id` 支持三种写法**：真实群号 `123456789`、13 位合成号、openid 字符串，
+   匹配时按字符串比。
+3. **`{at}` 用事件里的原始 ID 发送**（官方通道就是 openid）；`{id}` / `{group_id}` 能经
+   `neobot_app.user_identity` 反查出真实号就显示真实号，否则显示原始 ID，
+   想看原始值用 `{raw_id}` / `{raw_group_id}`。
+4. **命令优先用宿主 `CommandContext.conv_id`**，再按 `group_id` / `group_openid` / `chat_id` /
+   `conversation_id` 兜底——官方通道下 `conv_id` 就是 openid，宿主自己也是用它回复的。
+
+想让它显示真实群号/QQ 号（可选，纯展示用）：
 
 ```text
 /linkgroup 123456789        # 在目标群里由管理员发，把当前群绑定成这个真实群号
@@ -149,19 +157,23 @@ NeoBot 2.1.0a8 起，新部署默认走 QQ 官方机器人通道（`adapter.mode
 
 映射存在 `data/user_qq_map.json`，绑定后 `/欢迎 状态` 会显示「已绑定真实群号 xxx」。
 
+> 2.1.0a9 新增了只读命令 `/get groupid` 与 `/get openid [@用户]`，可以直接把官方 ID 复制出来填配置，
+> 不用再自己从日志里翻。
+
 > 如果 `/欢迎` 仍然回「这个命令只能在群里用」，那是真的没拿到会话 ID：日志里会打一行
 > `无法确定当前会话：event keys=[…] conv_id=… kind=…`，把那行发我，照着补映射即可。
 
-> ⚠️ **必须先知道的一件事**：官方通道**不推送群成员变动事件**。
-> `packages/adapter/src/neobot_adapter/official/events.py` 里 `MESSAGE_EVENTS` 只有
-> `C2C_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` 三种消息事件，
-> 其它 dispatch 一律丢弃；同时 `get_group_member_list` 在官方通道直接返回 `[]`（没有成员列表接口）。
-> 所以**纯官方通道下「入群欢迎」不会被触发**——不是 ID 对不上，是根本没有「有人进群」这个信号。
-> 想让 OneBot 侧提供入群事件，把 NeoBot 跑成 `adapter.mode = dual`；想只靠官方通道，用下面插件合成的入群事件。
+### 入群事件从哪来
 
-### 自己检测入群（轮询成员列表）
+| 通道 / 版本 | 入群信号 | 本插件行为 |
+| --- | --- | --- |
+| OneBot（NapCat 等） | 适配器推 `group_increase` | 直接欢迎 |
+| 官方 2.1.0a9+ | 适配器把官方成员增减事件映射成 `group_increase` / `group_decrease` | 直接欢迎（openid 字符串 ID） |
+| 官方 2.1.0a8 及更早 | 只有消息事件，没有成员变动，成员列表也拿不到 | 无信号，需要轮询或升级 |
 
-通道不推 `group_increase` 时，插件可以**自己去查**：定时调 `get_group_member_list`，和上一轮的名册做差集，多出来的人按「进群」处理。
+### 自己检测入群（轮询成员列表，兜底）
+
+不想依赖通道推送、或通道确实没有事件时，可以打开轮询：定时调 `get_group_member_list`，和上一轮的名册做差集。
 
 ```toml
 join_poll_enabled = true
@@ -176,23 +188,22 @@ join_poll_groups = [123456789] # 留空则用 groups 里的群，再不行问适
 - 新人当场写进名册，同一批不会重复欢迎；真实 notice 欢迎过的人也在名册里，两条路径天然去重；
 - 名单存在 `plugins_data/group_welcome/seen.json`，`/欢迎 重置` 清空本群后下一轮重新登记。
 
-**能力边界**：这条路依赖适配器能返回成员列表。
+**能力边界**：
 
-| 通道 | `get_group_member_list` | 轮询效果 |
+| 通道 / 版本 | `get_group_member_list` | 轮询效果 |
 | --- | --- | --- |
-| OneBot（NapCat 等） | 正常返回 | 可用；不过 OneBot 本来就推 `group_increase`，轮询只是兜底 |
-| 官方机器人 | 固定返回 `[]` | 拉不到名单，插件安静跳过（日志不刷屏） |
+| OneBot（NapCat 等） | 正常返回 | 可用；不过它本来就推 `group_increase`，轮询只是兜底 |
+| 官方 2.1.0a9+ | 走 `/v2/groups/{openid}/members`，返回 openid 成员 | 可用（ID 是 openid 字符串） |
+| 官方 2.1.0a8 及更早 | 固定返回 `[]` | 拉不到名单，插件安静跳过 |
 
-也就是说：官方通道想稳定拿到入群，仍然要让 NeoBot 跑 `adapter.mode = dual`（OneBot 账号在同一批群里），
-轮询才有数据源；纯官方通道目前没有可用的成员来源。`/欢迎 状态` 里的「本群 notice 事件」一行可以直接验证：
-官方通道恒为 0，OneBot 通道会随进出群累加。
+`/欢迎 状态` 里的「本群 notice 事件」一行可以直接验证当前通道有没有在推事件：官方 2.1.0a9+ 与 OneBot 都会累加。
 
 ## 排错
 
 | 现象 | 排查方向 |
 | --- | --- |
 | 进群完全没反应 | ① 面板里 `group_welcome` 是否已启用；② 协议端是否在推 `group_increase`（NapCat 的日志里能看到 `notice` 事件）；③ `enabled`、该群 `enabled`、`template` 是否被关/清空 |
-| 官方通道下收不到欢迎 | 官方通道没有群成员变动事件（见上一节）。要么 `adapter.mode = dual` 让 OneBot 侧触发，要么打开 `join_poll_enabled` 让插件自己比对成员列表（同样需要能拿到名单） |
+| 官方通道下收不到欢迎 | 先看版本：2.1.0a9+ 会推 `group_increase`，`/欢迎 状态` 的 notice 计数应该涨；a8 及更早没有事件，只能开 `join_poll_enabled`（那版也拿不到成员列表，需升级） |
 | 有欢迎语但没 @ 到人 | 模板里少了 `{at}`；部分协议端对群成员变动事件不带昵称，`{at}` 仍然可用 |
 | `{name}` 显示成 QQ 号 | 群成员资料接口没返回（比如人刚进群、缓存未命中），属正常回退 |
 | 退群提示不出现 | 默认 `leave_enabled = false`；另外退群事件本身可能不带昵称 |

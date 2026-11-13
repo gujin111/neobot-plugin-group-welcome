@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.0 — 2026-11-13
+
+适配 NeoBot **2.1.0a9**（官方通道改为直出 openid 字符串 + 原生成员事件）。
+
+- `_as_id()` 全面替代事件/轮询/命令里的 `_to_int()`：官方通道的 `455C4F9F…` 这类 openid
+  原样保留，不再被当成非法 ID 丢掉（此前 openid 入群事件会被静默忽略）
+- 官方 2.1.0a9 起适配器把成员增减映射成 `group_increase` / `group_decrease`，
+  本插件直接消费，`{at}` 用 openid 发
+- 机器人自身判断改为字符串比较，`self_id` 是 openid 时也能正确跳过
+- 轮询目标排序改为 `key=str`，兼容 int / openid 混排；成员列表里的 openid 同样走 `_as_id`
+- README 重写官方通道一节：a8（合成号）与 a9（openid）、事件来源、成员列表能力边界
+
 ## 1.6.0 — 2026-11-13
 
 `/欢迎` 的帮助页改成 HTML 卡片（图片）。

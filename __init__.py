@@ -80,7 +80,7 @@ class Config(BaseModel):
 
 plugin = Plugin(
     "group_welcome",
-    version="1.6.0",
+    version="1.7.0",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -223,7 +223,7 @@ def _pick(data: Any, *keys: str) -> str:
 
 
 async def _display_name(
-    ctx, event: dict[str, Any] | None, user_id: int, group_id: Any
+    ctx, event: dict[str, Any] | None, user_id: Any, group_id: Any
 ) -> str:
     """优先用群名片，其次昵称，最后退回 QQ 号。轮询路径没有事件，event 传 None。"""
     if event:
@@ -264,7 +264,7 @@ async def _group_name(ctx, group_id: Any) -> str:
     return name
 
 
-def _compose(template: str, values: dict[str, str], user_ids: list[int]) -> MessageChain:
+def _compose(template: str, values: dict[str, str], user_ids: list[Any]) -> MessageChain:
     """把模板渲染成消息链：文字段里插入 at 段，``{at}`` 可以出现在任意位置。"""
     rendered = _PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), template)
     parts = rendered.split(_AT_MARK)
@@ -282,7 +282,7 @@ async def _build_chain(
     ctx,
     template: str,
     group_id: Any,
-    members: list[tuple[int, str]],
+    members: list[tuple[Any, str]],
 ) -> MessageChain:
     user_ids = [uid for uid, _ in members]
     names = [name for _, name in members]
@@ -324,7 +324,7 @@ async def _send(ctx, group_id: Any, chain: MessageChain, what: str) -> None:
 # ── 合并进群 ──────────────────────────────────────────────────────
 
 
-def _queue(ctx, group_id: Any, template: str, user_id: int, name: str, delay: float) -> None:
+def _queue(ctx, group_id: Any, template: str, user_id: Any, name: str, delay: float) -> None:
     members = _pending.setdefault(group_id, [])
     for index, (uid, _old) in enumerate(members):
         if uid == user_id:
@@ -361,7 +361,7 @@ async def _flush_later(ctx, group_id: Any, template: str, delay: float) -> None:
         await _send_now(ctx, group_id, template, members)
 
 
-async def _send_now(ctx, group_id: Any, template: str, members: list[tuple[int, str]]) -> None:
+async def _send_now(ctx, group_id: Any, template: str, members: list[tuple[Any, str]]) -> None:
     chain = await _build_chain(ctx, template, group_id, members)
     if len(chain) == 0:  # 模板渲染成空串（例如只剩空白），别发空消息
         return
@@ -445,10 +445,10 @@ async def _fetch_member_ids(ctx, group_id: int) -> list[int] | None:
     items = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(items, (list, tuple)) or not items:
         return None
-    ids: list[int] = []
+    ids: list[Any] = []
     for item in items:
         raw = item.get("user_id") if isinstance(item, dict) else item
-        uid = _to_int(raw)
+        uid = _as_id(raw)
         if uid is not None:
             ids.append(uid)
     return ids or None
@@ -456,18 +456,18 @@ async def _fetch_member_ids(ctx, group_id: int) -> list[int] | None:
 
 async def _poll_targets(ctx, config: Config) -> list[int]:
     """要轮询的群：显式配置优先，其次 groups，最后问适配器要群列表。"""
-    targets: set[int] = set()
+    targets: set[Any] = set()
     for raw in config.join_poll_groups or ():
-        number = _to_int(raw)
+        number = _as_id(raw)
         if number is not None:
             targets.add(number)
     if not targets:
         for rule in config.groups or ():
-            number = _to_int(rule.group_id)
+            number = _as_id(rule.group_id)
             if number is not None:
                 targets.add(number)
     if targets:
-        return sorted(targets)
+        return sorted(targets, key=str)
 
     getter = getattr(getattr(ctx, "adapter", None), "get_group_list", None)
     if not callable(getter):
@@ -482,7 +482,7 @@ async def _poll_targets(ctx, config: Config) -> list[int]:
         number = _to_int(raw)
         if number is not None:
             targets.add(number)
-    return sorted(targets)
+    return sorted(targets, key=str)
 
 
 async def _poll_once(ctx, config: Config) -> None:
@@ -547,11 +547,11 @@ async def on_group_increase(event: dict[str, Any], ctx, config: Config) -> None:
 async def _handle_increase(event: dict[str, Any], ctx, config: Config, source: str = "notice") -> None:
     if not config.enabled:
         return
-    group_id = _to_int(event.get("group_id"))
-    user_id = _to_int(event.get("user_id"))
+    group_id = _as_id(event.get("group_id"))
+    user_id = _as_id(event.get("user_id"))
     if group_id is None or user_id is None:
         return
-    if user_id == _to_int(event.get("self_id")):
+    if str(user_id) == str(_as_id(event.get("self_id"))):
         return  # 机器人自己被拉进群，不用欢迎自己
     await _welcome_member(ctx, config, group_id, user_id, source=source, event=event)
 
@@ -604,11 +604,11 @@ async def _handle_decrease(event: dict[str, Any], ctx, config: Config) -> None:
         return
     if str(event.get("sub_type") or "") == "kick_me":
         return  # 机器人自己被踢，这个群已经发不出消息了
-    group_id = _to_int(event.get("group_id"))
-    user_id = _to_int(event.get("user_id"))
+    group_id = _as_id(event.get("group_id"))
+    user_id = _as_id(event.get("user_id"))
     if group_id is None or user_id is None:
         return
-    if user_id == _to_int(event.get("self_id")):
+    if str(user_id) == str(_as_id(event.get("self_id"))):
         return
 
     rule = _rule_for(config, group_id)
@@ -797,7 +797,7 @@ async def welcome_command(
         template = _effective_welcome(config, rule)
         if not template:
             return "当前没有配置欢迎语模板。"
-        user_id = _to_int(event.get("user_id")) or 0
+        user_id = _as_id(event.get("user_id")) or 0
         name = await _display_name(ctx, event, user_id, group_id) if user_id else "新成员"
         chain = await _build_chain(ctx, template, group_id, [(user_id, name)])
         try:

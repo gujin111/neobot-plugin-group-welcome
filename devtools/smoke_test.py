@@ -232,7 +232,11 @@ class FakeAdapter:
         return {"group_name": self.group_name}
 
     async def get_group_member_list(self, group_id):
-        return {"status": "ok", "retcode": 0, "data": list(self.members.get(int(group_id), []))}
+        # 兼容 int 群号与官方 openid 字符串两种键
+        items = self.members.get(group_id)
+        if items is None:
+            items = self.members.get(int(group_id), [])
+        return {"status": "ok", "retcode": 0, "data": list(items)}
 
     async def get_group_list(self):
         return {"status": "ok", "retcode": 0, "data": list(self.groups)}
@@ -594,6 +598,21 @@ async def case_join_poll() -> None:
     await _PLUGIN._poll_once(ctx5, cfg5)
     check("按 groups 里的群轮询", len(ctx5.sent) == 0 and (_PLUGIN._seen.get("555") is not None), str(_PLUGIN._seen.keys()))
 
+    # 2.1.0a9：官方成员列表返回 openid 字符串
+    openid_group = "455C4F9FA90747F3E4CAFA601C97C7F7"
+    openid_user = "EF5BFAF8C4B14899F39398E9E132D0BD"
+    ctx6 = FakeCtx(profiles={openid_user: FakeProfile(openid_user, nickname="小明")})
+    await _PLUGIN.on_load(ctx6)
+    ctx6.adapter.members[openid_group] = [{"user_id": "AAAA1111"}]
+    cfg6 = make_config(join_poll_enabled=True, join_poll_groups=[openid_group])
+    await _PLUGIN._poll_once(ctx6, cfg6)
+    check("openid 群首轮只登记", len(ctx6.sent) == 0, str(len(ctx6.sent)))
+    ctx6.adapter.members[openid_group].append({"user_id": openid_user})
+    ctx6.users = FakeUsers({openid_user: FakeProfile(openid_user, nickname="小明")})
+    await _PLUGIN._poll_once(ctx6, cfg6)
+    check("openid 成员被轮询识别为新人", len(ctx6.sent) == 1, str(len(ctx6.sent)))
+    check("欢迎发到 openid 群", ctx6.sent and ctx6.sent[0][0] == openid_group, str(ctx6.sent)[:80])
+
 
 async def case_official_command() -> None:
     print("官方通道：/欢迎 的会话 ID 解析")
@@ -713,6 +732,73 @@ async def case_help_card() -> None:
     check("开关关闭时直接回文字", isinstance(off, str) and "{at}" in off, str(off)[:60])
 
 
+async def case_a9_official_notice() -> None:
+    """2.1.0a9 起官方通道原生推 group_increase，ID 是 openid 字符串。"""
+    print("2.1.0a9：官方通道原生入群事件（openid 字符串）")
+    group = "455C4F9FA90747F3E4CAFA601C97C7F7"
+    user = "EF5BFAF8C4B14899F39398E9E132D0BD"
+    bot = "13278230174475345340"
+
+    ctx = FakeCtx(profiles={user: FakeProfile(user, nickname="小明")})
+    config = make_config(template="欢迎 {at} {name} 进群")
+    await _PLUGIN.on_group_increase(
+        {
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "sub_type": "approve",
+            "group_id": group,
+            "user_id": user,
+            "self_id": bot,
+            "time": 1,
+        },
+        ctx,
+        config,
+    )
+    check("openid 入群事件能触发欢迎", len(ctx.sent) == 1, str(len(ctx.sent)))
+    check("欢迎发到 openid 群", ctx.sent and ctx.sent[0][0] == group, str(ctx.sent)[:80])
+    check("@ 段用 openid", ctx.sent and ctx.sent[0][1].ats() == [user], str(ctx.sent[0][1].ats()))
+
+    ctx2 = FakeCtx(profiles={user: FakeProfile(user, nickname="小明")})
+    await _PLUGIN.on_group_decrease(
+        {
+            "post_type": "notice",
+            "notice_type": "group_decrease",
+            "sub_type": "leave",
+            "group_id": group,
+            "user_id": user,
+            "self_id": bot,
+        },
+        ctx2,
+        make_config(leave_enabled=True),
+    )
+    check("openid 退群事件也能处理", len(ctx2.sent) == 1, str(len(ctx2.sent)))
+
+    # 机器人自己被拉进群（self_id 也是 openid）不欢迎
+    ctx3 = FakeCtx(profiles={bot: FakeProfile(bot)})
+    await _PLUGIN.on_group_increase(
+        {
+            "post_type": "notice",
+            "notice_type": "group_increase",
+            "group_id": group,
+            "user_id": bot,
+            "self_id": bot,
+        },
+        ctx3,
+        make_config(),
+    )
+    check("机器人自己入群不欢迎", len(ctx3.sent) == 0, str(len(ctx3.sent)))
+
+    # 群规则里写 openid 也能命中
+    ctx4 = FakeCtx(profiles={user: FakeProfile(user, nickname="小明")})
+    rule = _PLUGIN.GroupRule(group_id=group, template="定制 {at}")
+    await _PLUGIN.on_group_increase(
+        {"post_type": "notice", "notice_type": "group_increase", "group_id": group, "user_id": user},
+        ctx4,
+        make_config(groups=[rule]),
+    )
+    check("按群规则（openid）命中", "定制" in ctx4.sent[0][1].plain(), ctx4.sent[0][1].plain())
+
+
 async def main() -> int:
     global _PLUGIN
     _PLUGIN = load_plugin()
@@ -748,6 +834,7 @@ async def main() -> int:
     await case_command()
     await case_official_command()
     await case_help_card()
+    await case_a9_official_notice()
     await case_official_ids()
     await case_join_poll()
 
