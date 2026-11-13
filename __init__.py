@@ -70,12 +70,17 @@ class Config(BaseModel):
         default_factory=list,
         description="要轮询的群；留空则轮询 groups 里配置的群，再不行问适配器要群列表",
     )
+    help_image_enabled: bool = Field(
+        default=True, description="/欢迎 的帮助页渲染成 HTML 卡片图片（失败自动回退文字）"
+    )
+    help_image_theme: str = Field(default="default", description="帮助卡片主题（宿主内置主题名）")
+    help_image_width: int = Field(default=760, description="帮助卡片宽度（像素）")
     groups: list[GroupRule] = Field(default_factory=list, description="按群定制（每个群一条）")
 
 
 plugin = Plugin(
     "group_welcome",
-    version="1.5.1",
+    version="1.6.0",
     description="入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员",
     author="NeoBot 第三方插件",
     config=Config,
@@ -628,6 +633,88 @@ _HELP = (
     "官方通道下 {id}/{group_id} 显示映射后的真实号码，{raw_id}/{raw_group_id} 显示通道 ID"
 )
 
+#: 帮助卡片的「命令」表格
+_HELP_COMMANDS = [
+    ["/欢迎", "本条帮助（HTML 卡片）"],
+    ["/欢迎 预览", "按当前群配置发一条示例"],
+    ["/欢迎 状态", "生效配置、身份绑定、轮询与 notice 计数"],
+    ["/欢迎 重置", "清空本群成员名册，下一轮重新登记"],
+]
+
+#: 帮助卡片的「模板变量」表格
+_HELP_VARS = [
+    ["{at}", "@ 新成员；合并进群时逐个 @"],
+    ["{name} / {user}", "群名片 → 昵称 → QQ 号"],
+    ["{id}", "真实 QQ 号（官方通道未绑定时是合成 ID）"],
+    ["{raw_id}", "通道原始用户 ID"],
+    ["{group} / {group_id}", "群名 / 群号"],
+    ["{raw_group_id}", "通道原始群 ID"],
+    ["{time} / {date} / {clock}", "发送时刻"],
+    ["{br}", "换行"],
+]
+
+
+async def _render_help_card(ctx, config: Config) -> bytes | None:
+    """把帮助页渲染成 PNG；渲染链路不可用时返回 None 交给文字兜底。"""
+    try:
+        from neobot_app.runtime.html_card import render_card_html, render_card_image
+    except Exception as exc:
+        ctx.logger.warning(f"[group_welcome] 无法导入卡片渲染模块: {type(exc).__name__}: {exc}")
+        return None
+    try:
+        html = render_card_html(
+            title="入群欢迎 / 退群提示",
+            subtitle=f"group_welcome {plugin.version}",
+            blocks=[
+                {"kind": "heading", "text": "命令"},
+                {"kind": "rows", "columns": ["命令", "作用"], "widths": ["36%", "64%"], "rows": _HELP_COMMANDS},
+                {"kind": "heading", "text": "模板变量"},
+                {"kind": "rows", "columns": ["变量", "含义"], "widths": ["36%", "64%"], "rows": _HELP_VARS},
+                {
+                    "kind": "note",
+                    "text": (
+                        f"合并窗口 {float(config.delay_seconds or 0.0):g} 秒 · "
+                        f"入群轮询 {'开' if config.join_poll_enabled else '关'} · "
+                        f"退群提示 {'开' if config.leave_enabled else '关'}"
+                    ),
+                },
+            ],
+            footer="发「/欢迎 预览」看实际效果",
+            theme=str(config.help_image_theme or "default"),
+            width=int(config.help_image_width or 760),
+        )
+    except Exception as exc:
+        ctx.logger.warning(f"[group_welcome] 帮助卡片 HTML 生成失败: {type(exc).__name__}: {exc}")
+        return None
+    try:
+        return await render_card_image(
+            html, timeout=25.0, screenshots=getattr(ctx, "screenshots", None)
+        )
+    except Exception as exc:
+        ctx.logger.warning(f"[group_welcome] 帮助卡片渲染失败: {type(exc).__name__}: {exc}")
+        return None
+
+
+async def _send_card(ctx, command_context: Any, reply: Any, png: bytes) -> bool:
+    """发图：优先走命令服务的 send_image_bytes（与宿主 /help 同一条路），退回 Reply。"""
+    service = getattr(command_context, "service", None)
+    kind = str(getattr(command_context, "kind", "") or "")
+    conv_id = str(getattr(command_context, "conv_id", "") or "")
+    sender = getattr(service, "send_image_bytes", None)
+    if callable(sender) and kind and conv_id:
+        try:
+            if await sender(kind, conv_id, png, filename="welcome-help.png"):
+                return True
+        except Exception as exc:
+            ctx.logger.warning(f"[group_welcome] send_image_bytes 失败: {type(exc).__name__}: {exc}")
+    if reply is not None:
+        try:
+            await reply.image(data=png, filename="welcome-help.png")
+            return True
+        except Exception as exc:
+            ctx.logger.warning(f"[group_welcome] Reply.image 失败: {type(exc).__name__}: {exc}")
+    return False
+
 
 def _status_text(config: Config, group_id: Any) -> str:
     rule = _rule_for(config, group_id)
@@ -693,6 +780,7 @@ async def welcome_command(
     ctx,
     config: Config,
     command_context=None,
+    reply=None,
 ) -> str | None:
     text = (action or "").strip()
     group_id = _resolve_group_id(event, command_context)
@@ -725,6 +813,13 @@ async def welcome_command(
         _seen.pop(_display_group_id(group_id), None)
         _save_seen()
         return "已清空本群的成员名册，下一轮轮询会重新登记（不补欢迎）。"
+
+    if config.help_image_enabled:
+        png = await _render_help_card(ctx, config)
+        if png:
+            if await _send_card(ctx, command_context, reply, png):
+                return None
+            ctx.logger.warning("[group_welcome] 帮助卡片发送失败，回退文字版")
 
     return _HELP
 

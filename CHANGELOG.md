@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.0 — 2026-11-13
+
+`/欢迎` 的帮助页改成 HTML 卡片（图片）。
+
+- 用宿主 `neobot_app.runtime.html_card` 渲染：标题 + 命令表 + 模板变量表 + 状态备注
+- 发送优先走 `CommandContext.service.send_image_bytes`（与宿主 `/help` 同一条路，
+  官方通道也走这个），失败退回 `Reply.image`，再失败回退纯文本
+- 新增配置 `help_image_enabled` / `help_image_theme` / `help_image_width`
+
 ## 1.5.1 — 2026-11-13
 
 修官方通道 `/欢迎` 误报「这个命令只能在群里用」。

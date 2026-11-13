@@ -1,5 +1,5 @@
 name = "group_welcome"
-version = "1.5.1"
+version = "1.6.0"
 description = "入群欢迎 / 退群提示：合并进群、按群定制模板、@ 新成员"
 author = "NeoBot 第三方插件"
 license = "MIT"
@@ -30,3 +30,10 @@ join_poll_enabled = false
 join_poll_seconds = 300
 # 要轮询的群；留空则用 groups 里配置的群，再不行问适配器要群列表
 join_poll_groups = []
+
+# /欢迎 的帮助页渲染成 HTML 卡片图片（失败自动回退文字）
+help_image_enabled = true
+# 帮助卡片主题（宿主内置主题名，未知回落 default）
+help_image_theme = "default"
+# 帮助卡片宽度（像素）
+help_image_width = 760

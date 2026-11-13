@@ -109,6 +109,7 @@ class FakePlugin:
     def __init__(self, name: str, **kwargs) -> None:
         self.name = name
         self.kwargs = kwargs
+        self.version = str(kwargs.get("version") or "")
         self.events: list[dict] = []
         self.commands: list[dict] = []
         self.load_hooks: list = []
@@ -435,11 +436,32 @@ async def case_leave() -> None:
 
 
 class FakeCommandContext:
-    """宿主命令上下文的最小子集：kind + conv_id。"""
+    """宿主命令上下文的最小子集：kind + conv_id（可选 service）。"""
 
-    def __init__(self, kind="group", conv_id=""):
+    def __init__(self, kind="group", conv_id="", service=None):
         self.kind = kind
         self.conv_id = conv_id
+        self.service = service
+
+
+class FakeImageService:
+    """只实现 send_image_bytes，验证优先走宿主命令服务的发图通道。"""
+
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.sent = []
+
+    async def send_image_bytes(self, kind, conv_id, data, *, at_user_id=None, filename=None):
+        self.sent.append((kind, conv_id, data, filename))
+        return self.ok
+
+
+class FakeReply:
+    def __init__(self):
+        self.images = []
+
+    async def image(self, *, data=None, filename=None):
+        self.images.append((data, filename))
 
 
 async def case_command() -> None:
@@ -613,6 +635,84 @@ async def case_official_command() -> None:
     check("groups 里写 openid 也能命中", "定制" in ctx4.sent[0][1].plain(), ctx4.sent[0][1].plain())
 
 
+def _install_html_card_stub(png: bytes = b"\x89PNG-help") -> dict:
+    """假的宿主卡片渲染器，用来确认帮助页真的走了出图路径。"""
+    package = sys.modules.get("neobot_app") or types.ModuleType("neobot_app")
+    runtime = types.ModuleType("neobot_app.runtime")
+    card = types.ModuleType("neobot_app.runtime.html_card")
+    calls: dict = {}
+
+    def render_card_html(**kwargs):
+        calls["html"] = kwargs
+        return "<html>help</html>"
+
+    async def render_card_image(html, *, timeout=20.0, screenshots=None, fonts=None):
+        calls["rendered"] = html
+        return png
+
+    card.render_card_html = render_card_html
+    card.render_card_image = render_card_image
+    runtime.html_card = card
+    package.runtime = runtime
+    sys.modules["neobot_app"] = package
+    sys.modules["neobot_app.runtime"] = runtime
+    sys.modules["neobot_app.runtime.html_card"] = card
+    return calls
+
+
+def _uninstall_html_card_stub() -> None:
+    for name in ("neobot_app.runtime.html_card", "neobot_app.runtime", "neobot_app"):
+        sys.modules.pop(name, None)
+
+
+async def case_help_card() -> None:
+    print("帮助页：HTML 卡片")
+    ctx = FakeCtx()
+    config = make_config()
+
+    text = await _PLUGIN.welcome_command("", {"group_id": 999, "user_id": 1}, ctx, config, None, FakeReply())
+    check("没有渲染器时回退文字", isinstance(text, str) and "{at}" in text, str(text)[:60])
+
+    calls = _install_html_card_stub()
+    try:
+        reply = FakeReply()
+        result = await _PLUGIN.welcome_command("", {"group_id": 999, "user_id": 1}, ctx, config, None, reply)
+        check("出图成功时不再回文字", result is None, str(result))
+        check("通过 Reply 发了一张图", len(reply.images) == 1 and reply.images[0][0] == b"\x89PNG-help", str(reply.images))
+        blocks = (calls.get("html") or {}).get("blocks", [])
+        kinds = [block.get("kind") for block in blocks]
+        check("卡片有 heading / rows / note", kinds.count("rows") == 2 and "note" in kinds, str(kinds))
+        check(
+            "命令表在卡片里",
+            any("/欢迎 预览" in str(row) for row in blocks[1].get("rows", [])),
+            str(blocks[1])[:80],
+        )
+
+        service = FakeImageService(ok=True)
+        reply2 = FakeReply()
+        ctx2 = FakeCtx()
+        command_context = FakeCommandContext(conv_id="455C4F9F", service=service)
+        result2 = await _PLUGIN.welcome_command(
+            "帮助", {"group_id": 999, "user_id": 1}, ctx2, config, command_context, reply2
+        )
+        check("优先走命令服务发图", result2 is None and len(service.sent) == 1, str(service.sent)[:60])
+        check("服务发图时不再走 Reply", not reply2.images, str(reply2.images))
+
+        service_fail = FakeImageService(ok=False)
+        reply3 = FakeReply()
+        result3 = await _PLUGIN.welcome_command(
+            "", {"group_id": 999, "user_id": 1}, ctx, config, FakeCommandContext(service=service_fail), reply3
+        )
+        check("命令服务失败后退回 Reply", result3 is None and len(reply3.images) == 1, str(reply3.images))
+    finally:
+        _uninstall_html_card_stub()
+
+    off = await _PLUGIN.welcome_command(
+        "", {"group_id": 999, "user_id": 1}, ctx, make_config(help_image_enabled=False), None, FakeReply()
+    )
+    check("开关关闭时直接回文字", isinstance(off, str) and "{at}" in off, str(off)[:60])
+
+
 async def main() -> int:
     global _PLUGIN
     _PLUGIN = load_plugin()
@@ -647,6 +747,7 @@ async def main() -> int:
     await case_leave()
     await case_command()
     await case_official_command()
+    await case_help_card()
     await case_official_ids()
     await case_join_poll()
 
